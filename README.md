@@ -2,7 +2,7 @@
 
 A gRPC PDF backend service over the MIT-licensed qpdf-based cell parser,
 implementing the fleet's common `PdfBackendService` contract
-(`ai.pipestream.parse.pdf.v1`, from the pipestream-protos release this
+(`ai.pipestream.parse.pdf.v1`, from the parser-protos commit this
 build pins). The wrapper is Apache-2.0; the engine and its dependency set
 (qpdf, blend2d, freetype, openjpeg, lcms2, libjpeg) are all permissive.
 
@@ -30,9 +30,9 @@ ctest --test-dir build --output-on-failure
 
 The build pins the engine by commit (FetchContent) and compiles its
 dependency set from source the way the engine's own tree does. The
-contract protos come from the pinned pipestream-protos release tarball
-(sha256-verified). `-DPDF_PROTO_LOCAL_DIR=/path/to/pipestream-protos`
-switches to a local contract checkout for contract development.
+contract protos come from the pinned parser-protos commit
+(sha256-verified). `-DPDF_PROTO_LOCAL_DIR=/path/to/gRParse/backends`
+switches to a local directory of proto files for contract development.
 
 ## Run
 
