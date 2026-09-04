@@ -31,3 +31,19 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   self-contained `src/sha256.cpp` on purpose: gRPC links its vendored
   BoringSSL statically, and adding a second crypto library risks duplicate
   symbol definitions.
+- Default port is 50070 (`GRPC_QPARSE_PORT` overrides), the fleet-registered
+  assignment in the workspace table; the backend fleet used to collide with
+  gRParse/grPOIc/grpc-libreoffice on 50051-50053.
+- `GetServiceInfo` reports the same `backend_name`/`engine_version` strings
+  Probe reports, a `build_version` stamped at compile time
+  (`-DGRPC_QPARSE_BUILD_VERSION`, git describe in a checkout, `dev`
+  fallback), and the family `UiInfo` block (`/ui/qparse`; no web UI yet,
+  the field exists so the demo shell tab can appear when one lands).
+- The Dockerfile is multi-stage on ubuntu:26.04 (build compiles and runs
+  ctest as the image gate; runtime carries the binary plus the engine font
+  resources under `/usr/local/share/grpc-qparse/pdf_resources`) and builds
+  amd64 only, like the family's other C++ services.
+  `.github/workflows/publish.yml` pushes `docker.io/pipestreamai/grpc-qparse:latest`
+  on every push to main (plus a `:<version>` tag on manual dispatch) with
+  the `DOCKER_USER`/`DOCKER_TOKEN` org secrets, passing the ref name as the
+  `GRPC_QPARSE_BUILD_VERSION` build arg so the image reports its tag.

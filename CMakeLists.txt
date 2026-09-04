@@ -157,6 +157,28 @@ file(COPY "${TOPLEVEL_PREFIX_PATH}/docling_parse/pdf_resources/"
 # ---------------------------------------------------------------------------
 # The service binary.
 # ---------------------------------------------------------------------------
+# The build version GetServiceInfo reports: the image tag when built in
+# Docker (passed as -DGRPC_QPARSE_BUILD_VERSION), git describe in a checkout,
+# "dev" as the fallback.
+set(GRPC_QPARSE_BUILD_VERSION "" CACHE STRING
+    "build version stamped into GetServiceInfo, for example the image tag")
+if(NOT GRPC_QPARSE_BUILD_VERSION)
+  find_package(Git QUIET)
+  if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+    execute_process(
+      COMMAND ${GIT_EXECUTABLE} describe --tags --always --dirty
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      OUTPUT_VARIABLE GRPC_QPARSE_GIT_DESCRIBE
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+  endif()
+  if(GRPC_QPARSE_GIT_DESCRIBE)
+    set(GRPC_QPARSE_BUILD_VERSION "${GRPC_QPARSE_GIT_DESCRIBE}")
+  else()
+    set(GRPC_QPARSE_BUILD_VERSION "dev")
+  endif()
+endif()
+
 add_executable(grpc_qparse
   src/main.cpp
   src/qparse_service_impl.cpp
@@ -165,7 +187,8 @@ add_executable(grpc_qparse
 target_include_directories(grpc_qparse PRIVATE src)
 target_include_directories(grpc_qparse SYSTEM PRIVATE "${TOPLEVEL_PREFIX_PATH}/src")
 target_compile_definitions(grpc_qparse PRIVATE
-  ROOT_PATH="${TOPLEVEL_PREFIX_PATH}" LOGURU_WITH_STREAMS=1)
+  ROOT_PATH="${TOPLEVEL_PREFIX_PATH}" LOGURU_WITH_STREAMS=1
+  GRPC_QPARSE_BUILD_VERSION="${GRPC_QPARSE_BUILD_VERSION}")
 target_link_libraries(grpc_qparse PRIVATE pdf_backend_proto ${ENGINE_DEPENDENCIES} grpc_qparse_flags)
 
 # ---------------------------------------------------------------------------
@@ -180,7 +203,8 @@ add_executable(qparse_contract_test
 target_include_directories(qparse_contract_test PRIVATE src)
 target_include_directories(qparse_contract_test SYSTEM PRIVATE "${TOPLEVEL_PREFIX_PATH}/src")
 target_compile_definitions(qparse_contract_test PRIVATE
-  ROOT_PATH="${TOPLEVEL_PREFIX_PATH}" LOGURU_WITH_STREAMS=1)
+  ROOT_PATH="${TOPLEVEL_PREFIX_PATH}" LOGURU_WITH_STREAMS=1
+  GRPC_QPARSE_BUILD_VERSION="${GRPC_QPARSE_BUILD_VERSION}")
 target_link_libraries(qparse_contract_test PRIVATE pdf_backend_proto ${ENGINE_DEPENDENCIES} grpc_qparse_flags)
 add_test(NAME qparse_contract COMMAND qparse_contract_test
   "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/hello.pdf"

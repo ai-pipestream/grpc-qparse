@@ -45,8 +45,8 @@ workspace `AGENTS.md`); `GRPC_QPARSE_PORT` overrides it.
 
 `GRPC_QPARSE_RESOURCES` points at the engine's font resource directory
 (staged into the build tree at configure time). Health and server
-reflection are enabled; `Probe`, `Parse`, and `Render` are the service
-surface.
+reflection are enabled; `Probe`, `Parse`, `Render`, and `GetServiceInfo`
+are the service surface.
 
 ## Docker
 

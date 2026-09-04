@@ -87,6 +87,35 @@ int main(int argc, char** argv) {
           "non-PDF bytes report LOAD_STATUS_NOT_PDF");
   }
 
+  // GetServiceInfo: the identity block, independent of any document.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ServiceInfoRequest request;
+    pdfv1::ServiceInfoResponse response;
+    Check(stub->GetServiceInfo(&ctx, request, &response).ok(),
+          "GetServiceInfo RPC OK");
+    Check(response.backend_name() == "grpc-qparse", "info backend name");
+    Check(!response.engine_version().empty(), "info engine version");
+    Check(!response.build_version().empty(), "info build version");
+    Check(response.ui().title() == "qparse", "info UI title");
+    Check(response.ui().path() == "/ui/qparse", "info UI path");
+    Check(!response.ui().description().empty(), "info UI description");
+
+    // backend_name and engine_version must be the strings Probe reports.
+    grpc::ClientContext probe_ctx;
+    pdfv1::ProbeRequest probe_request;
+    probe_request.mutable_document()->set_data(hello);
+    pdfv1::ProbeResponse probe_response;
+    Check(stub->Probe(&probe_ctx, probe_request, &probe_response).ok(),
+          "identity Probe RPC OK");
+    Check(probe_response.capabilities().backend_name() ==
+              response.backend_name(),
+          "info backend name matches Probe");
+    Check(probe_response.capabilities().engine_version() ==
+              response.engine_version(),
+          "info engine version matches Probe");
+  }
+
   // Parse rich.pdf: tier 0 plus this engine's strengths.
   {
     grpc::ClientContext ctx;

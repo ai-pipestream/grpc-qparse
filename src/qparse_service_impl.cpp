@@ -18,6 +18,12 @@ namespace grpc_qparse {
 
 namespace pdfv1 = ai::protomolt::parse::pdf::v1;
 
+// CMake stamps this from the image tag or git describe; the fallback keeps
+// the translation unit self-contained.
+#ifndef GRPC_QPARSE_BUILD_VERSION
+#define GRPC_QPARSE_BUILD_VERSION "dev"
+#endif
+
 namespace {
 
 constexpr char kBackendName[] = "grpc-qparse";
@@ -776,6 +782,25 @@ grpc::Status QparseServiceImpl::Render(
     raster->set_pixels(canvas->data(), canvas->size());
     if (!writer->Write(msg)) return grpc::Status::OK;
   }
+  return grpc::Status::OK;
+}
+
+grpc::Status QparseServiceImpl::GetServiceInfo(
+    grpc::ServerContext* /*context*/,
+    const pdfv1::ServiceInfoRequest* /*request*/,
+    pdfv1::ServiceInfoResponse* response) {
+  // backend_name and engine_version are the same identity strings every
+  // Probe reports; build_version is stamped at compile time (the image tag
+  // in Docker, git describe in a checkout, "dev" otherwise).
+  response->set_backend_name(kBackendName);
+  response->set_engine_version(kEngineVersion);
+  response->set_build_version(GRPC_QPARSE_BUILD_VERSION);
+  auto* ui = response->mutable_ui();
+  ui->set_title("qparse");
+  ui->set_path("/ui/qparse");
+  ui->set_description(
+      "Reading-order text cells, vector shapes, and page rasters from the "
+      "qpdf-based cell parser; no web UI yet, the tab appears when one lands");
   return grpc::Status::OK;
 }
 

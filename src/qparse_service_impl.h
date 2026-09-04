@@ -41,6 +41,11 @@ class QparseServiceImpl final
       grpc::ServerWriter<ai::protomolt::parse::pdf::v1::RenderResponse>*
           writer) override;
 
+  grpc::Status GetServiceInfo(
+      grpc::ServerContext* context,
+      const ai::protomolt::parse::pdf::v1::ServiceInfoRequest* request,
+      ai::protomolt::parse::pdf::v1::ServiceInfoResponse* response) override;
+
  private:
   DocumentCache cache_;
 };
