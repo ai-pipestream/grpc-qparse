@@ -19,7 +19,7 @@ constexpr int kMaxMessageBytes = 520 * 1024 * 1024;
 int main() {
   const char* port_env = std::getenv("GRPC_QPARSE_PORT");
   const std::string address =
-      std::string("0.0.0.0:") + (port_env != nullptr ? port_env : "50052");
+      std::string("0.0.0.0:") + (port_env != nullptr ? port_env : "50070");
   const char* resources_env = std::getenv("GRPC_QPARSE_RESOURCES");
   grpc_qparse::InitEngine(resources_env != nullptr ? resources_env
                                                    : "./pdf_resources");

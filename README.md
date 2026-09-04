@@ -37,8 +37,11 @@ switches to a local directory of proto files for contract development.
 ## Run
 
 ```bash
-GRPC_QPARSE_PORT=50052 GRPC_QPARSE_RESOURCES=./build/pdf_resources ./build/grpc_qparse
+GRPC_QPARSE_PORT=50070 GRPC_QPARSE_RESOURCES=./build/pdf_resources ./build/grpc_qparse
 ```
+
+50070 is the fleet-registered default port (the fleet table lives in the
+workspace `AGENTS.md`); `GRPC_QPARSE_PORT` overrides it.
 
 `GRPC_QPARSE_RESOURCES` points at the engine's font resource directory
 (staged into the build tree at configure time). Health and server
