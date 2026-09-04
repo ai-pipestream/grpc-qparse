@@ -48,6 +48,19 @@ workspace `AGENTS.md`); `GRPC_QPARSE_PORT` overrides it.
 reflection are enabled; `Probe`, `Parse`, and `Render` are the service
 surface.
 
+## Docker
+
+```bash
+docker build -t grpc-qparse .
+docker run --rm --read-only --tmpfs /tmp -p 50070:50070 grpc-qparse
+```
+
+The build stage compiles the service and runs the contract test as the
+image gate; the runtime stage carries only the binary and the engine's
+font resources (wired up through `GRPC_QPARSE_RESOURCES`). amd64 only,
+like the family's other C++ services. The publish workflow pushes
+`docker.io/pipestreamai/grpc-qparse:latest` on every push to main.
+
 ## Content-addressed documents
 
 The contract lets a client upload a document once and address it by hash
