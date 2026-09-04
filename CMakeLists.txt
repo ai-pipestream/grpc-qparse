@@ -31,16 +31,16 @@ FetchContent_MakeAvailable(grpc)
 # holds the same bytes. -DPDF_PROTO_LOCAL_DIR=<directory holding the .proto
 # files> overrides for contract development only.
 # ---------------------------------------------------------------------------
-set(PDF_PROTOS_COMMIT "fba7556c073dba4f907a94841c358424c6786962"
+set(PDF_PROTOS_COMMIT "4d72ec2c4550f8110ba03550f659c931d57e024d"
     CACHE STRING "parser-protos commit the contract comes from")
 set(PDF_PROTOS_BASE_URL
     "https://git.rokkon.com/ai-pipestream/parser-protos/raw/commit/${PDF_PROTOS_COMMIT}/proto/ai/protomolt/parse/pdf/v1"
     CACHE STRING "base URL the contract proto files are downloaded from")
 set(PDF_PROTO_TYPES_SHA256
-    "86c4bc05e92e640d2defdfac861cf9cea747da3cb38268f933380a4f76bb0fda"
+    "5570baad185a6f008976c8f013a48382b04c83b54a60ccdf94b0cd0a65bf2cce"
     CACHE STRING "sha256 of pdf_backend_types.proto")
 set(PDF_PROTO_SERVICE_SHA256
-    "b50b551beb869af100860c6be1bca8832fff27622be0a6f882fb347e72792a98"
+    "ae8ae5bb765e771b98176501ffc59583bf0c0428b7aa45e37e011f1e02aeeecd"
     CACHE STRING "sha256 of pdf_backend_service.proto")
 set(PDF_PROTO_LOCAL_DIR "" CACHE PATH "directory holding the contract protos, instead of the pinned download")
 
@@ -159,7 +159,9 @@ file(COPY "${TOPLEVEL_PREFIX_PATH}/docling_parse/pdf_resources/"
 # ---------------------------------------------------------------------------
 add_executable(grpc_qparse
   src/main.cpp
-  src/qparse_service_impl.cpp)
+  src/qparse_service_impl.cpp
+  src/document_cache.cpp
+  src/sha256.cpp)
 target_include_directories(grpc_qparse PRIVATE src)
 target_include_directories(grpc_qparse SYSTEM PRIVATE "${TOPLEVEL_PREFIX_PATH}/src")
 target_compile_definitions(grpc_qparse PRIVATE
@@ -172,7 +174,9 @@ target_link_libraries(grpc_qparse PRIVATE pdf_backend_proto ${ENGINE_DEPENDENCIE
 enable_testing()
 add_executable(qparse_contract_test
   test/contract_roundtrip_test.cpp
-  src/qparse_service_impl.cpp)
+  src/qparse_service_impl.cpp
+  src/document_cache.cpp
+  src/sha256.cpp)
 target_include_directories(qparse_contract_test PRIVATE src)
 target_include_directories(qparse_contract_test SYSTEM PRIVATE "${TOPLEVEL_PREFIX_PATH}/src")
 target_compile_definitions(qparse_contract_test PRIVATE

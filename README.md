@@ -44,3 +44,26 @@ GRPC_QPARSE_PORT=50052 GRPC_QPARSE_RESOURCES=./build/pdf_resources ./build/grpc_
 (staged into the build tree at configure time). Health and server
 reflection are enabled; `Probe`, `Parse`, and `Render` are the service
 surface.
+
+## Content-addressed documents
+
+The contract lets a client upload a document once and address it by hash
+afterwards: send `data` together with `sha256` (the lowercase hex SHA-256
+of `data`) on the first call, then call with `sha256` alone. The service
+keeps the bytes in a small in-memory LRU cache in the single server
+process and answers a lookup it cannot satisfy with the typed
+`LOAD_STATUS_BYTES_REQUIRED` verdict (in `ProbeResponse.capabilities`, the
+`ParseHeader` capabilities, or the `RenderResponse` head), which the
+client answers by retrying exactly once with the bytes. Bytes that do not
+hash to the given `sha256` get `LOAD_STATUS_HASH_MISMATCH` on the same
+surfaces; `data` empty with no `sha256` is `INVALID_ARGUMENT`.
+
+Cache bounds come from the environment:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GRPC_QPARSE_CACHE_MAX_DOCUMENTS` | 8 | Documents kept at most; 0 disables caching. |
+| `GRPC_QPARSE_CACHE_MAX_BYTES` | 2147483648 (2 GiB) | Total cached bytes ceiling; a document larger than this is never cached. |
+
+Eviction is least-recently-used. Cache lifetime is the process lifetime;
+the contract promises only the verdicts, never retention.

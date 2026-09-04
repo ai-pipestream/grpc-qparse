@@ -22,3 +22,12 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   `resource_utils::set_resources_dir`) or decode throws `map::at`. Never
   expand a truncated engine commit hash from memory; take it from
   `git rev-parse`.
+- The content-addressed handshake (`PdfDocument.sha256`) is served by an
+  in-memory LRU byte cache in the server process
+  (`src/document_cache.{h,cpp}`), shared by Probe, Parse and Render through
+  the one `ResolveDocumentBytes` path in `src/qparse_service_impl.cpp`.
+  Bounds: `GRPC_QPARSE_CACHE_MAX_DOCUMENTS` (default 8),
+  `GRPC_QPARSE_CACHE_MAX_BYTES` (default 2 GiB). SHA-256 is the
+  self-contained `src/sha256.cpp` on purpose: gRPC links its vendored
+  BoringSSL statically, and adding a second crypto library risks duplicate
+  symbol definitions.

@@ -12,6 +12,8 @@
 #include <parse.h>
 #include <render.h>
 
+#include "sha256.h"
+
 namespace grpc_qparse {
 
 namespace pdfv1 = ai::protomolt::parse::pdf::v1;
@@ -58,12 +60,56 @@ const char* UnsupportedDetail(pdfv1::PdfFamily family) {
 struct LoadedDocument {
   pdflib::pdf_timings timings;
   std::unique_ptr<pdflib::pdf_decoder<pdflib::DOCUMENT>> doc;
+  // The resolved document bytes; kept alive for the engine's decode.
+  std::shared_ptr<std::string> buffer;
   pdfv1::LoadStatus status = pdfv1::LOAD_STATUS_UNSPECIFIED;
   std::string detail;
 };
 
-void LoadDocument(const pdfv1::PdfDocument& request, LoadedDocument* out) {
+// How ResolveDocumentBytes answered, so the RPC can pick its failure
+// surface: a typed load verdict rides in the response, while a contract
+// violation is a gRPC INVALID_ARGUMENT.
+enum class ResolveOutcome { kOk, kVerdict, kInvalidArgument };
+
+// The one content-addressing resolution path shared by Probe, Parse and
+// Render. With data present and a sha256 given, the bytes are hashed and
+// verified (a mismatch is LOAD_STATUS_HASH_MISMATCH) and cached under the
+// digest; data without a sha256 is used without touching the cache. With
+// data empty the request is a cache lookup by sha256 (a miss is
+// LOAD_STATUS_BYTES_REQUIRED). data empty with sha256 absent is invalid.
+ResolveOutcome ResolveDocumentBytes(const pdfv1::PdfDocument& request,
+                                    DocumentCache* cache,
+                                    LoadedDocument* out) {
   const std::string& data = request.data();
+  if (!data.empty()) {
+    out->buffer = std::make_shared<std::string>(data);
+    if (!request.has_sha256()) return ResolveOutcome::kOk;
+    const std::string digest = Sha256Hex(data);
+    if (request.sha256() != digest) {
+      out->status = pdfv1::LOAD_STATUS_HASH_MISMATCH;
+      out->detail = "data does not hash to the given sha256";
+      return ResolveOutcome::kVerdict;
+    }
+    cache->Insert(digest, out->buffer);
+    return ResolveOutcome::kOk;
+  }
+  if (!request.has_sha256()) {
+    out->detail = "document data is empty and no sha256 names a cached "
+                  "document";
+    return ResolveOutcome::kInvalidArgument;
+  }
+  std::shared_ptr<std::string> cached = cache->Lookup(request.sha256());
+  if (cached == nullptr) {
+    out->status = pdfv1::LOAD_STATUS_BYTES_REQUIRED;
+    out->detail = "no cached bytes for sha256 " + request.sha256();
+    return ResolveOutcome::kVerdict;
+  }
+  out->buffer = std::move(cached);
+  return ResolveOutcome::kOk;
+}
+
+void LoadDocument(const pdfv1::PdfDocument& request, LoadedDocument* out) {
+  const std::string& data = *out->buffer;
   if (data.rfind("%PDF-", 0) != 0) {
     out->status = pdfv1::LOAD_STATUS_NOT_PDF;
     out->detail = "missing %PDF- header";
@@ -71,12 +117,11 @@ void LoadDocument(const pdfv1::PdfDocument& request, LoadedDocument* out) {
   }
   out->doc =
       std::make_unique<pdflib::pdf_decoder<pdflib::DOCUMENT>>(out->timings);
-  auto buffer = std::make_shared<std::string>(data);
   std::optional<std::string> password;
   if (request.has_password()) password = request.password();
   bool ok = false;
   try {
-    ok = out->doc->process_document_from_bytesio(buffer, password,
+    ok = out->doc->process_document_from_bytesio(out->buffer, password,
                                                  "grpc-qparse request");
   } catch (const std::exception& e) {
     out->detail = e.what();
@@ -491,7 +536,15 @@ grpc::Status QparseServiceImpl::Probe(grpc::ServerContext* /*context*/,
                                       const pdfv1::ProbeRequest* request,
                                       pdfv1::ProbeResponse* response) {
   LoadedDocument loaded;
-  LoadDocument(request->document(), &loaded);
+  switch (ResolveDocumentBytes(request->document(), &cache_, &loaded)) {
+    case ResolveOutcome::kInvalidArgument:
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, loaded.detail);
+    case ResolveOutcome::kVerdict:
+      break;
+    case ResolveOutcome::kOk:
+      LoadDocument(request->document(), &loaded);
+      break;
+  }
   FillCapabilities(loaded, response->mutable_capabilities());
   return grpc::Status::OK;
 }
@@ -500,8 +553,15 @@ grpc::Status QparseServiceImpl::Parse(
     grpc::ServerContext* /*context*/, const pdfv1::ParseRequest* request,
     grpc::ServerWriter<pdfv1::ParseResponse>* writer) {
   LoadedDocument loaded;
-  LoadDocument(request->document(), &loaded);
-
+  switch (ResolveDocumentBytes(request->document(), &cache_, &loaded)) {
+    case ResolveOutcome::kInvalidArgument:
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, loaded.detail);
+    case ResolveOutcome::kVerdict:
+      break;
+    case ResolveOutcome::kOk:
+      LoadDocument(request->document(), &loaded);
+      break;
+  }
   const pdflib::decode_config config = MakeDecodeConfig();
   int page_count =
       loaded.status == pdfv1::LOAD_STATUS_OK ? loaded.doc->get_number_of_pages()
@@ -656,12 +716,24 @@ grpc::Status QparseServiceImpl::Render(
                         "dpi must be positive");
   }
   LoadedDocument loaded;
-  LoadDocument(request->document(), &loaded);
+  switch (ResolveDocumentBytes(request->document(), &cache_, &loaded)) {
+    case ResolveOutcome::kInvalidArgument:
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, loaded.detail);
+    case ResolveOutcome::kVerdict:
+      break;
+    case ResolveOutcome::kOk:
+      LoadDocument(request->document(), &loaded);
+      break;
+  }
   if (loaded.status != pdfv1::LOAD_STATUS_OK) {
-    return grpc::Status(
-        grpc::StatusCode::FAILED_PRECONDITION,
-        "document did not load: " + pdfv1::LoadStatus_Name(loaded.status) +
-            (loaded.detail.empty() ? "" : " (" + loaded.detail + ")"));
+    // A failed load, cache miss included, is typed in a one-message head
+    // stream, never a bare gRPC error.
+    pdfv1::RenderResponse head_msg;
+    auto* head = head_msg.mutable_head();
+    head->set_load_status(loaded.status);
+    if (!loaded.detail.empty()) head->set_load_detail(loaded.detail);
+    writer->Write(head_msg);
+    return grpc::Status::OK;
   }
 
   int page_count = loaded.doc->get_number_of_pages();
