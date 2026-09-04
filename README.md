@@ -2,7 +2,7 @@
 
 A gRPC PDF backend service over the MIT-licensed qpdf-based cell parser,
 implementing the fleet's common `PdfBackendService` contract
-(`ai.pipestream.parse.pdf.v1`, from the parser-protos commit this
+(`ai.protomolt.parse.pdf.v1`, from the parser-protos commit this
 build pins). The wrapper is Apache-2.0; the engine and its dependency set
 (qpdf, blend2d, freetype, openjpeg, lcms2, libjpeg) are all permissive.
 

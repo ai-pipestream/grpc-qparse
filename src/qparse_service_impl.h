@@ -4,7 +4,7 @@
 
 #include <grpcpp/grpcpp.h>
 
-#include "ai/pipestream/parse/pdf/v1/pdf_backend_service.grpc.pb.h"
+#include "ai/protomolt/parse/pdf/v1/pdf_backend_service.grpc.pb.h"
 
 namespace grpc_qparse {
 
@@ -16,23 +16,23 @@ void InitEngine(const std::string& resources_dir);
 // instances, so the service is plain thread-per-request with no worker
 // pool.
 class QparseServiceImpl final
-    : public ai::pipestream::parse::pdf::v1::PdfBackendService::Service {
+    : public ai::protomolt::parse::pdf::v1::PdfBackendService::Service {
  public:
   grpc::Status Probe(
       grpc::ServerContext* context,
-      const ai::pipestream::parse::pdf::v1::ProbeRequest* request,
-      ai::pipestream::parse::pdf::v1::ProbeResponse* response) override;
+      const ai::protomolt::parse::pdf::v1::ProbeRequest* request,
+      ai::protomolt::parse::pdf::v1::ProbeResponse* response) override;
 
   grpc::Status Parse(
       grpc::ServerContext* context,
-      const ai::pipestream::parse::pdf::v1::ParseRequest* request,
-      grpc::ServerWriter<ai::pipestream::parse::pdf::v1::ParseResponse>*
+      const ai::protomolt::parse::pdf::v1::ParseRequest* request,
+      grpc::ServerWriter<ai::protomolt::parse::pdf::v1::ParseResponse>*
           writer) override;
 
   grpc::Status Render(
       grpc::ServerContext* context,
-      const ai::pipestream::parse::pdf::v1::RenderRequest* request,
-      grpc::ServerWriter<ai::pipestream::parse::pdf::v1::RenderResponse>*
+      const ai::protomolt::parse::pdf::v1::RenderRequest* request,
+      grpc::ServerWriter<ai::protomolt::parse::pdf::v1::RenderResponse>*
           writer) override;
 };
 

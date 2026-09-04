@@ -15,7 +15,7 @@
 
 #include "qparse_service_impl.h"
 
-namespace pdfv1 = ai::pipestream::parse::pdf::v1;
+namespace pdfv1 = ai::protomolt::parse::pdf::v1;
 
 namespace {
 
