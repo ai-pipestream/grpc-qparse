@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.27
-# grpc-qparse image: the qpdf-based cell-parser PDF backend (amd64 only,
-# like the family's other C++ services).
+# grpc-qparse image: the qpdf-based cell-parser PDF backend, published as a
+# linux/amd64 + linux/arm64 manifest list (each leg built and smoke-tested
+# natively on its own architecture).
 #
 # The build stage compiles the service and the commit-pinned engine with
 # its dependency set from source and runs the contract test; the test gates
@@ -38,7 +39,9 @@ ARG GRPC_QPARSE_BUILD_VERSION
 # at configure time (sha256-verified), so the build needs network access.
 # Unix Makefiles, not Ninja: the engine's extlib ExternalProjects do not
 # declare BUILD_BYPRODUCTS, which Ninja requires. The cache id encodes every
-# ABI-sensitive dependency; bump it when gRPC or the toolchain moves.
+# ABI-sensitive dependency; bump it when gRPC or the toolchain moves. The id
+# also keys on the target architecture: multi-arch publish legs share cache
+# mounts by id, so an unkeyed id would let the arm64 leg reuse amd64 objects.
 # Compile parallelism is bounded: an unbounded build on a shared builder
 # starves its neighbours and gets the compiler OOM-killed; 8 jobs is what
 # the gRPC compile tolerates beside other builds.
@@ -46,7 +49,7 @@ ARG GRPC_QPARSE_BUILD_VERSION
 # run, or an interrupted build that left a truncated object behind) gets its
 # own tree through --build-arg GRPC_QPARSE_BUILD_CACHE_SCOPE=-<name>.
 ARG GRPC_QPARSE_BUILD_CACHE_SCOPE=
-RUN --mount=type=cache,id=grpc-qparse-trixie-grpc1.83.1-make${GRPC_QPARSE_BUILD_CACHE_SCOPE},target=/build \
+RUN --mount=type=cache,id=grpc-qparse-trixie-grpc1.83.1-make-${TARGETARCH}${GRPC_QPARSE_BUILD_CACHE_SCOPE},target=/build \
     cmake -S . -B /build -DCMAKE_BUILD_TYPE=Release \
         -DGRPC_QPARSE_BUILD_VERSION=${GRPC_QPARSE_BUILD_VERSION} \
     && cmake --build /build --parallel 8 \

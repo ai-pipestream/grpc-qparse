@@ -1,13 +1,28 @@
 name: Publish Images
 
 # Builds the service image (the build stage runs the test suite), boot-proofs
-# the runtime stage with scripts/smoke-test.sh, and only then pushes it to
+# the runtime stage with scripts/smoke-test.sh, and only then names it on
 # docker.io/pipestreamai. Every push to main republishes :latest; a manual
 # dispatch with a version input also tags that version. Docker Hub
 # credentials come from the DOCKER_USER / DOCKER_TOKEN org secrets.
 #
-# amd64-only: the C++ services have no arm64 consumers, so no QEMU setup
-# and a single linux/amd64 platform.
+# Build once, gate, then name. `load: true` cannot carry attestations and a
+# multi-platform image cannot be loaded at all, so every leg is built once
+# with provenance (mode=max) and SBOM attestations and pushed BY DIGEST
+# ONLY: no tag points at it, it is invisible under any public name. The leg
+# then pulls that digest back and runs the smoke test on its own
+# architecture; only a digest that passed is recorded as an artifact. The
+# `publish` job assembles the recorded digests into the tagged manifest list
+# with `docker buildx imagetools create` (scripts/publish-manifests.sh) and
+# inspects the result: the index must list exactly linux/amd64 and
+# linux/arm64 with one attestation manifest per platform, or the job fails.
+# So the smoke gate still runs before any tag exists, and the attestations
+# on the published image are the ones the build produced.
+#
+# The amd64 leg builds on GitHub's hosted ubuntu-latest. The arm64 leg
+# builds natively on GitHub's hosted ubuntu-24.04-arm runner (free for this
+# public repository); no QEMU anywhere. Buildx cache mounts are shared by id, so the Dockerfile keys
+# its cache id on the target architecture.
 on:
   push:
     branches: [main]
@@ -18,9 +33,27 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: read
+
+env:
+  HUB_REPO: docker.io/pipestreamai/grpc-qparse
+
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            timeout: 180
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            timeout: 180
     steps:
       - uses: actions/checkout@v4
       - name: Set up Docker Buildx
@@ -31,33 +64,84 @@ jobs:
           registry: docker.io
           username: ${{ secrets.DOCKER_USER }}
           password: ${{ secrets.DOCKER_TOKEN }}
-      - name: Compute tags
-        id: tags
+      - name: Name the repository and platform this leg pushes by digest
+        id: names
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          echo "names=$HUB_REPO" >> "$GITHUB_OUTPUT"
+          echo "platform_pair=${PLATFORM//\//-}" >> "$GITHUB_OUTPUT"
+      - name: Build (runs the test suite in the build stage) and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            GRPC_QPARSE_BUILD_VERSION=${{ github.ref_name }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+          outputs: type=image,"name=${{ steps.names.outputs.names }}",push-by-digest=true,name-canonical=true,push=true
+      - name: Boot-proof the pushed digest before it gets a name
+        # The image under test is the exact digest that was pushed, pulled
+        # back from the registry, so what passes here is what gets tagged.
+        env:
+          IMAGE: ${{ env.HUB_REPO }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE"
+          ./scripts/smoke-test.sh "$IMAGE"
+      - name: Record the digest that passed
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - name: Upload the digest for the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ steps.names.outputs.platform_pair }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish the manifest list
+    needs: build
+    # One tag set, so a missing leg must not tag an incomplete index: only
+    # assemble when every leg passed its build and smoke gate.
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the digests that passed their smoke gate
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to Docker Hub (docker.io)
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+      - name: Create the manifest list and prove it
         env:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          tags="docker.io/pipestreamai/grpc-qparse:latest"
-          if [ -n "$VERSION" ]; then
-            tags="$tags,docker.io/pipestreamai/grpc-qparse:$VERSION"
-          fi
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
-          echo "push_tags=$(tr ',' ' ' <<<"$tags")" >> "$GITHUB_OUTPUT"
-      - name: Build the service image (runs the test suite in the build stage)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          load: true
-          provenance: false
-          sbom: false
-          build-args: |
-            GRPC_QPARSE_BUILD_VERSION=${{ github.ref_name }}
-          tags: ${{ steps.tags.outputs.tags }}
-      - name: Boot-proof the image before any push
-        run: ./scripts/smoke-test.sh docker.io/pipestreamai/grpc-qparse:latest
-      - name: Push all tags
-        run: |
-          for tag in ${{ steps.tags.outputs.push_tags }}; do
-            docker push "$tag"
+          digests=()
+          for file in "$RUNNER_TEMP"/digests/*; do
+            [ -e "$file" ] && digests+=("$(basename "$file")")
           done
+          ./scripts/publish-manifests.sh --version "$VERSION" \
+            --platforms linux/amd64,linux/arm64 --repo "$HUB_REPO" "${digests[@]}"
