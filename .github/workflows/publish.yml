@@ -1,9 +1,10 @@
 name: Publish Images
 
-# Builds the service image and pushes it to docker.io/pipestreamai. Every
-# push to main republishes :latest; a manual dispatch with a version input
-# also tags that version. Docker Hub credentials come from the DOCKER_USER /
-# DOCKER_TOKEN org secrets.
+# Builds the service image (the build stage runs the test suite), boot-proofs
+# the runtime stage with scripts/smoke-test.sh, and only then pushes it to
+# docker.io/pipestreamai. Every push to main republishes :latest; a manual
+# dispatch with a version input also tags that version. Docker Hub
+# credentials come from the DOCKER_USER / DOCKER_TOKEN org secrets.
 #
 # amd64-only: the C++ services have no arm64 consumers, so no QEMU setup
 # and a single linux/amd64 platform.
@@ -32,20 +33,31 @@ jobs:
           password: ${{ secrets.DOCKER_TOKEN }}
       - name: Compute tags
         id: tags
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
+          set -euo pipefail
           tags="docker.io/pipestreamai/grpc-qparse:latest"
-          if [ -n "${{ inputs.version }}" ]; then
-            tags="$tags,docker.io/pipestreamai/grpc-qparse:${{ inputs.version }}"
+          if [ -n "$VERSION" ]; then
+            tags="$tags,docker.io/pipestreamai/grpc-qparse:$VERSION"
           fi
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
-      - name: Build and push the service image
+          echo "push_tags=$(tr ',' ' ' <<<"$tags")" >> "$GITHUB_OUTPUT"
+      - name: Build the service image (runs the test suite in the build stage)
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
-          push: true
+          load: true
           provenance: false
           sbom: false
           build-args: |
             GRPC_QPARSE_BUILD_VERSION=${{ github.ref_name }}
           tags: ${{ steps.tags.outputs.tags }}
+      - name: Boot-proof the image before any push
+        run: ./scripts/smoke-test.sh docker.io/pipestreamai/grpc-qparse:latest
+      - name: Push all tags
+        run: |
+          for tag in ${{ steps.tags.outputs.push_tags }}; do
+            docker push "$tag"
+          done
