@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.26
+# syntax=docker/dockerfile:1.27
 # grpc-qparse image: the qpdf-based cell-parser PDF backend (amd64 only,
 # like the family's other C++ services).
 #
