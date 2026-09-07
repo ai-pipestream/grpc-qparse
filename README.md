@@ -52,14 +52,33 @@ are the service surface.
 
 ```bash
 docker build -t grpc-qparse .
-docker run --rm --read-only --tmpfs /tmp -p 50070:50070 grpc-qparse
+docker run --rm --read-only -p 50070:50070 grpc-qparse
+scripts/smoke-test.sh grpc-qparse     # boot-proof a built image
 ```
 
-The build stage compiles the service and runs the contract test as the
-image gate; the runtime stage carries only the binary and the engine's
-font resources (wired up through `GRPC_QPARSE_RESOURCES`). amd64 only,
-like the family's other C++ services. The publish workflow pushes
-`docker.io/pipestreamai/grpc-qparse:latest` on every push to main.
+The build stage (a Debian trixie toolchain) compiles the service and runs
+the contract test as the image gate. The runtime stage is the hardened
+`dhi.io/debian-base:trixie-debian13` base: glibc and nothing else, no
+package manager, no ldconfig, and the service runs as uid 65532 out of the
+box, so no `--user` flag is needed. It carries the binary, the engine's
+font resources (wired up through `GRPC_QPARSE_RESOURCES`, unchanged at
+`/usr/local/share/grpc-qparse/pdf_resources`), and the shared libraries
+the binary needs beyond glibc (libstdc++, libgcc_s, libz), staged from the
+build stage into `/usr/local/lib` and found through `LD_LIBRARY_PATH`;
+`scripts/stage-runtime-libs.sh` copies that closure at build time and
+fails the build if anything would resolve from outside it. The base is
+swappable with `--build-arg GRPC_QPARSE_RUNTIME_IMAGE=<image>` for any
+image whose glibc is 2.41 or newer. Nothing is written at runtime, so the
+container runs read-only without a tmpfs.
+
+`scripts/smoke-test.sh IMAGE` is the boot gate CI and the publish workflow
+run before any push: the library closure resolves inside the image (the
+dynamic loader reports it, since the base has no `ldd`), the server
+reaches its "listening on" line under `--read-only --cap-drop ALL` (which
+also proves the engine found its font resources), and every process runs
+as uid 65532. amd64 only, like the family's other C++ services. The
+publish workflow pushes `docker.io/pipestreamai/grpc-qparse:latest` on
+every push to main.
 
 ## Content-addressed documents
 

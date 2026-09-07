@@ -39,11 +39,21 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   (`-DGRPC_QPARSE_BUILD_VERSION`, git describe in a checkout, `dev`
   fallback), and the family `UiInfo` block (`/ui/qparse`; no web UI yet,
   the field exists so the demo shell tab can appear when one lands).
-- The Dockerfile is multi-stage on ubuntu:26.04 (build compiles and runs
-  ctest as the image gate; runtime carries the binary plus the engine font
-  resources under `/usr/local/share/grpc-qparse/pdf_resources`) and builds
-  amd64 only, like the family's other C++ services.
-  `.github/workflows/publish.yml` pushes `docker.io/pipestreamai/grpc-qparse:latest`
-  on every push to main (plus a `:<version>` tag on manual dispatch) with
-  the `DOCKER_USER`/`DOCKER_TOKEN` org secrets, passing the ref name as the
+- The Dockerfile is multi-stage: the build stage (Debian trixie
+  toolchain) compiles and runs ctest as the image gate; the runtime is the
+  hardened `dhi.io/debian-base:trixie-debian13` base (glibc only, no
+  package manager, no ldconfig, uid 65532) carrying the binary, the engine
+  font resources under `/usr/local/share/grpc-qparse/pdf_resources`, and
+  the staged shared-library closure (`scripts/stage-runtime-libs.sh`)
+  under `/usr/local/lib` on `LD_LIBRARY_PATH`. The build stage must stay on
+  a glibc no newer than the runtime base's (2.41); a build on ubuntu 26.04
+  produces a binary the base cannot load. `GRPC_QPARSE_RUNTIME_IMAGE`
+  swaps the base. Builds amd64 only, like the family's other C++ services.
+  `scripts/smoke-test.sh IMAGE` is the boot gate (closure, boot to
+  listening under the hardened flags, uid); `ci.yml` runs the image build
+  then the smoke test, and `.github/workflows/publish.yml` builds,
+  smoke-tests, and only then pushes
+  `docker.io/pipestreamai/grpc-qparse:latest` on every push to main (plus
+  a `:<version>` tag on manual dispatch) with the
+  `DOCKER_USER`/`DOCKER_TOKEN` org secrets, passing the ref name as the
   `GRPC_QPARSE_BUILD_VERSION` build arg so the image reports its tag.
