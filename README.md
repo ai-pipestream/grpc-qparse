@@ -30,6 +30,12 @@ font table; programs are decoded and sent, once each, only when
 `embedded` whenever its font dictionary carries a program (`/FontFile`,
 `/FontFile2` or `/FontFile3`), whether or not the call decodes it.
 
+A document that does not open gets the typed verdict qpdf's error code
+gives: `LOAD_STATUS_PASSWORD_REQUIRED` for an encrypted file opened
+without a password, `LOAD_STATUS_PASSWORD_INCORRECT` when the password
+given does not open it, `LOAD_STATUS_CORRUPT` for damage qpdf cannot
+recover from, and `LOAD_STATUS_ENGINE_ERROR` for anything else.
+
 The engine is safe to use concurrently through independent per-request
 decoder instances, so the service is plain thread-per-request; there is no
 worker-process pool here.

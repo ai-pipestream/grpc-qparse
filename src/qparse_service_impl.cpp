@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <qpdf/QPDF.hh>
+#include <qpdf/QPDFExc.hh>
 #include <qpdf/QPDFObjectHandle.hh>
 #include <qpdf/QPDFPageObjectHelper.hh>
 
@@ -268,9 +269,14 @@ std::set<FontKey> EmbeddedFontsOf(QPDFObjectHandle resources) {
 class DocumentPages {
  public:
   // Opens the bytes, which must outlive this object: qpdf reads them in
-  // place. Returns false with qpdf's message when the bytes do not open.
-  bool Open(const std::string& bytes, const std::optional<std::string>& password,
-            std::string* error) {
+  // place. Returns LOAD_STATUS_OK, or the verdict qpdf's error code gives
+  // with its message in error: a password qpdf refuses is
+  // PASSWORD_REQUIRED, or PASSWORD_INCORRECT when the call supplied one,
+  // damage qpdf cannot recover from is CORRUPT, and anything else is
+  // ENGINE_ERROR.
+  pdfv1::LoadStatus Open(const std::string& bytes,
+                         const std::optional<std::string>& password,
+                         std::string* error) {
     try {
       qpdf_.setSuppressWarnings(true);
       qpdf_.processMemoryFile("grpc-qparse request", bytes.data(), bytes.size(),
@@ -278,11 +284,22 @@ class DocumentPages {
       pages_ = qpdf_.getAllPages();
       geometry_.reserve(pages_.size());
       for (const auto& page : pages_) geometry_.push_back(ReadPageGeometry(page));
+    } catch (const QPDFExc& e) {
+      *error = e.what();
+      switch (e.getErrorCode()) {
+        case qpdf_e_password:
+          return password.has_value() ? pdfv1::LOAD_STATUS_PASSWORD_INCORRECT
+                                      : pdfv1::LOAD_STATUS_PASSWORD_REQUIRED;
+        case qpdf_e_damaged_pdf:
+          return pdfv1::LOAD_STATUS_CORRUPT;
+        default:
+          return pdfv1::LOAD_STATUS_ENGINE_ERROR;
+      }
     } catch (const std::exception& e) {
       *error = e.what();
-      return false;
+      return pdfv1::LOAD_STATUS_ENGINE_ERROR;
     }
-    return true;
+    return pdfv1::LOAD_STATUS_OK;
   }
 
   int page_count() const { return static_cast<int>(pages_.size()); }
@@ -411,18 +428,29 @@ void LoadDocument(const pdfv1::PdfDocument& request, bool with_pages,
   } catch (const std::exception& e) {
     out->detail = e.what();
   }
-  if (ok && with_pages) {
-    out->pages = std::make_unique<DocumentPages>();
-    ok = out->pages->Open(data, password, &out->detail);
-    if (!ok) out->pages.reset();
+  if (ok && !with_pages) {
+    out->status = pdfv1::LOAD_STATUS_OK;
+    return;
   }
-  if (ok) {
+  // The engine reports an open failure as a plain false, so the call's own
+  // qpdf handle, which Parse and Render need anyway, opens the bytes too:
+  // its error code tells a password or damaged file apart from an engine
+  // failure.
+  auto pages = std::make_unique<DocumentPages>();
+  std::string pages_detail;
+  const pdfv1::LoadStatus pages_status =
+      pages->Open(data, password, &pages_detail);
+  if (ok && pages_status == pdfv1::LOAD_STATUS_OK) {
+    out->pages = std::move(pages);
     out->status = pdfv1::LOAD_STATUS_OK;
     return;
   }
   out->doc.reset();
-  // The engine reports open failures as a plain false; qpdf's password and
-  // damage cases are not distinguishable from here yet.
+  if (pages_status != pdfv1::LOAD_STATUS_OK) {
+    out->status = pages_status;
+    out->detail = pages_detail;
+    return;
+  }
   out->status = pdfv1::LOAD_STATUS_ENGINE_ERROR;
   if (out->detail.empty()) out->detail = "engine could not open the document";
 }

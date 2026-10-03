@@ -1,7 +1,8 @@
 // Contract test for grpc-qparse: start the engine-backed service in
 // process, dial it through the generated stubs, and walk the tier 0
 // families plus this backend's own strengths (reading-order cells, shapes,
-// embedded fonts) over the hello.pdf, rich.pdf and frames.pdf fixtures.
+// embedded fonts) over the hello.pdf, rich.pdf, fonts.pdf, frames.pdf and
+// encrypted.pdf fixtures.
 
 #include <algorithm>
 #include <array>
@@ -330,6 +331,79 @@ int main(int argc, char** argv) {
     Check(stub->Probe(&ctx, request, &response).ok(), "non-PDF Probe RPC OK");
     Check(response.capabilities().load_status() == pdfv1::LOAD_STATUS_NOT_PDF,
           "non-PDF bytes report LOAD_STATUS_NOT_PDF");
+  }
+
+  // A document that does not open says why: encrypted.pdf (user password
+  // "secret") needs a password, takes only the right one, and bytes past a
+  // %PDF- header that qpdf cannot recover are corrupt, on all three RPCs.
+  {
+    const std::string encrypted = ReadFile(fixture_dir + "/encrypted.pdf");
+    Check(!encrypted.empty(), "encrypted.pdf read");
+    struct Opening {
+      std::string data;
+      std::optional<std::string> password;
+      pdfv1::LoadStatus want;
+      const char* what;
+    };
+    for (const Opening& opening :
+         {Opening{encrypted, std::nullopt, pdfv1::LOAD_STATUS_PASSWORD_REQUIRED,
+                  "encrypted.pdf without a password"},
+          Opening{encrypted, "wrong", pdfv1::LOAD_STATUS_PASSWORD_INCORRECT,
+                  "encrypted.pdf with a wrong password"},
+          Opening{encrypted, "secret", pdfv1::LOAD_STATUS_OK,
+                  "encrypted.pdf with its password"},
+          Opening{"%PDF-1.7\nnothing a PDF parser can recover\n", std::nullopt,
+                  pdfv1::LOAD_STATUS_CORRUPT, "a header and no body"}}) {
+      const std::string what = std::string(opening.what) + ": ";
+      pdfv1::PdfDocument document;
+      document.set_data(opening.data);
+      if (opening.password.has_value()) {
+        document.set_password(*opening.password);
+      }
+      {
+        grpc::ClientContext ctx;
+        pdfv1::ProbeRequest request;
+        *request.mutable_document() = document;
+        pdfv1::ProbeResponse response;
+        Check(stub->Probe(&ctx, request, &response).ok() &&
+                  response.capabilities().load_status() == opening.want,
+              what + "Probe reports " + pdfv1::LoadStatus_Name(opening.want));
+        Check(opening.want == pdfv1::LOAD_STATUS_OK ||
+                  !response.capabilities().load_detail().empty(),
+              what + "Probe says why");
+      }
+      {
+        grpc::ClientContext ctx;
+        pdfv1::ParseRequest request;
+        *request.mutable_document() = document;
+        auto reader = stub->Parse(&ctx, request);
+        pdfv1::ParseResponse msg;
+        Check(reader->Read(&msg) && msg.has_header() &&
+                  msg.header().capabilities().load_status() == opening.want,
+              what + "Parse header reports " +
+                  pdfv1::LoadStatus_Name(opening.want));
+        while (reader->Read(&msg)) {
+        }
+        Check(reader->Finish().ok(), what + "Parse finishes OK");
+      }
+      {
+        grpc::ClientContext ctx;
+        pdfv1::RenderRequest request;
+        *request.mutable_document() = document;
+        request.set_dpi(9.0);
+        auto reader = stub->Render(&ctx, request);
+        pdfv1::RenderResponse msg;
+        const bool read = reader->Read(&msg);
+        Check(opening.want == pdfv1::LOAD_STATUS_OK
+                  ? read && msg.has_raster()
+                  : read && msg.has_head() &&
+                        msg.head().load_status() == opening.want,
+              what + "Render answers " + pdfv1::LoadStatus_Name(opening.want));
+        while (reader->Read(&msg)) {
+        }
+        Check(reader->Finish().ok(), what + "Render finishes OK");
+      }
+    }
   }
 
   // GetServiceInfo: the identity block, independent of any document.
