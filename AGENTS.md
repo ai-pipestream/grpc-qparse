@@ -79,5 +79,7 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   passing digests into
   `docker.io/pipestreamai/grpc-qparse:latest` on every push to main (plus
   a `:<version>` tag on manual dispatch) with the
-  `DOCKER_USER`/`DOCKER_TOKEN` org secrets, passing the ref name as the
-  `GRPC_QPARSE_BUILD_VERSION` build arg so the image reports its tag.
+  `DOCKER_USER`/`DOCKER_TOKEN` org secrets, passing the dispatch version,
+  or the commit sha on a push, as the `GRPC_QPARSE_BUILD_VERSION` build arg
+  so the image reports which build it is. `ci.yml` and `publish.yml` both
+  run with a read-only `contents` token.

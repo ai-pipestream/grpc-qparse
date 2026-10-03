@@ -80,12 +80,14 @@ jobs:
           platforms: ${{ matrix.platform }}
           provenance: mode=max
           sbom: true
+          # The ref name is always "main" here; the dispatch version, or the
+          # commit on a push, is what tells two images apart.
           build-args: |
-            GRPC_QPARSE_BUILD_VERSION=${{ github.ref_name }}
+            GRPC_QPARSE_BUILD_VERSION=${{ inputs.version || github.sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.version=${{ inputs.version || github.sha }}
           outputs: type=image,"name=${{ steps.names.outputs.names }}",push-by-digest=true,name-canonical=true,push=true
       - name: Boot-proof the pushed digest before it gets a name
         # The image under test is the exact digest that was pushed, pulled
