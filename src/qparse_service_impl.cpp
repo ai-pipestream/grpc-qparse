@@ -973,6 +973,37 @@ bool WantPageItems(const pdfv1::ParseRequest& request) {
   return false;
 }
 
+// The pages a call covers, zero-based and half-open.
+struct PageSpan {
+  int begin = 0;
+  int end = 0;
+};
+
+// The contract's one rule for a set PageRange: end greater than begin. Any
+// other uint32 range is valid, and SelectPages clamps it to the document.
+grpc::Status CheckPageRange(const pdfv1::PageRange& range) {
+  if (range.end() <= range.begin()) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                        "page range end must be greater than begin (got " +
+                            std::to_string(range.begin()) + ", " +
+                            std::to_string(range.end()) + ")");
+  }
+  return grpc::Status::OK;
+}
+
+// The pages a checked range selects, clamped to the document in unsigned
+// space before narrowing, so an end past the document stops at its last
+// page and a begin past it (2^31 and up included) selects no page rather
+// than turning into a negative index; unset selects every page.
+PageSpan SelectPages(bool has_range, const pdfv1::PageRange& range,
+                     int page_count) {
+  const uint32_t count = page_count > 0 ? static_cast<uint32_t>(page_count) : 0;
+  if (!has_range) return {0, static_cast<int>(count)};
+  const uint32_t begin = std::min(range.begin(), count);
+  const uint32_t end = std::max(begin, std::min(range.end(), count));
+  return {static_cast<int>(begin), static_cast<int>(end)};
+}
+
 void AddPageWarning(pdfv1::ParseTrailer* trailer, int page_index,
                     const std::string& message) {
   auto* warning = trailer->add_warnings();
@@ -1026,6 +1057,11 @@ grpc::Status QparseServiceImpl::Probe(grpc::ServerContext* /*context*/,
 grpc::Status QparseServiceImpl::Parse(
     grpc::ServerContext* context, const pdfv1::ParseRequest* request,
     grpc::ServerWriter<pdfv1::ParseResponse>* writer) {
+  if (request->has_pages()) {
+    if (grpc::Status range = CheckPageRange(request->pages()); !range.ok()) {
+      return range;
+    }
+  }
   LoadedDocument loaded;
   switch (ResolveDocumentBytes(request->document(), &cache_, &loaded)) {
     case ResolveOutcome::kInvalidArgument:
@@ -1082,13 +1118,8 @@ grpc::Status QparseServiceImpl::Parse(
     }
   }
 
-  int begin = 0;
-  int end = page_count;
-  if (request->has_pages()) {
-    begin =
-        std::min<int>(static_cast<int>(request->pages().begin()), page_count);
-    end = std::min<int>(static_cast<int>(request->pages().end()), page_count);
-  }
+  const PageSpan span =
+      SelectPages(request->has_pages(), request->pages(), page_count);
 
   const bool want_fonts = WantFamily(*request, pdfv1::PDF_FAMILY_FONTS);
   const bool want_programs =
@@ -1101,7 +1132,7 @@ grpc::Status QparseServiceImpl::Parse(
   counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] = static_cast<uint64_t>(page_count);
   pdfv1::ParseResponse trailer_msg;
   auto* trailer = trailer_msg.mutable_trailer();
-  for (int i = begin; client_ok && i < end; ++i) {
+  for (int i = span.begin; client_ok && i < span.end; ++i) {
     // A cancelled or expired call stops decoding at the next page.
     if (context->IsCancelled()) {
       return grpc::Status(grpc::StatusCode::CANCELLED,
@@ -1226,6 +1257,11 @@ grpc::Status QparseServiceImpl::Render(
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                         "dpi must be a positive finite number");
   }
+  if (request->has_pages()) {
+    if (grpc::Status range = CheckPageRange(request->pages()); !range.ok()) {
+      return range;
+    }
+  }
   LoadedDocument loaded;
   switch (ResolveDocumentBytes(request->document(), &cache_, &loaded)) {
     case ResolveOutcome::kInvalidArgument:
@@ -1247,18 +1283,12 @@ grpc::Status QparseServiceImpl::Render(
     return grpc::Status::OK;
   }
 
-  int page_count = loaded.pages->page_count();
-  int begin = 0;
-  int end = page_count;
-  if (request->has_pages()) {
-    begin =
-        std::min<int>(static_cast<int>(request->pages().begin()), page_count);
-    end = std::min<int>(static_cast<int>(request->pages().end()), page_count);
-  }
+  const PageSpan span = SelectPages(request->has_pages(), request->pages(),
+                                    loaded.pages->page_count());
 
   // Every page is sized before any is rendered, so a page over the budget
   // fails the call before a raster streams or a canvas is allocated.
-  for (int i = begin; i < end; ++i) {
+  for (int i = span.begin; i < span.end; ++i) {
     const std::array<double, 2> size =
         RasterSize(loaded.pages->geometry(i), scale);
     if (size[0] > kMaxRasterSide || size[1] > kMaxRasterSide ||
@@ -1278,7 +1308,7 @@ grpc::Status QparseServiceImpl::Render(
   pdflib::render_config render_cfg;
   render_cfg.scale = scale;
 
-  for (int i = begin; i < end; ++i) {
+  for (int i = span.begin; i < span.end; ++i) {
     // A cancelled or expired call stops rendering at the next page.
     if (context->IsCancelled()) {
       return grpc::Status(grpc::StatusCode::CANCELLED,

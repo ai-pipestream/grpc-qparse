@@ -124,6 +124,14 @@ Cache bounds come from the environment:
 Eviction is least-recently-used. Cache lifetime is the process lifetime;
 the contract promises only the verdicts, never retention.
 
+## Page ranges
+
+A set `PageRange` must have `end` greater than `begin`, the contract's one
+rule for it; anything else fails `Parse` and `Render` with
+`INVALID_ARGUMENT` before a message streams. Every other range is valid:
+an `end` past the document stops at its last page, and a range that starts
+past it selects no page, however large its `begin`.
+
 ## Render bounds
 
 `Render` takes a positive finite `dpi`; anything else (zero, negative,

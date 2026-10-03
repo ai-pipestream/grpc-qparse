@@ -1207,6 +1207,72 @@ int main(int argc, char** argv) {
           "a one-page Render range decodes one page");
   }
 
+  // PageRange is zero-based and half-open, and a set range needs end
+  // greater than begin; anything else is INVALID_ARGUMENT before a message
+  // streams. Every other uint32 range is valid and is clamped to the
+  // document: an end past it stops at the last page, and a begin past it
+  // selects no page, 2^31 and up included (those used to narrow to a
+  // negative int).
+  {
+    struct BadRange {
+      uint32_t begin;
+      uint32_t end;
+      const char* what;
+    };
+    for (const BadRange& bad :
+         {BadRange{5u, 3u, "end below begin"},
+          BadRange{1u, 1u, "end equal to begin"},
+          BadRange{4294967295u, 1u, "begin 2^32-1, end 1"}}) {
+      ParseResult parsed =
+          ParseDocument(stub.get(), frames, {pdfv1::PDF_FAMILY_TEXT_CELLS},
+                        std::make_pair(bad.begin, bad.end));
+      Check(parsed.status.error_code() == grpc::INVALID_ARGUMENT &&
+                parsed.header.pages_size() == 0 && parsed.pages.empty(),
+            std::string("Parse range ") + bad.what + " is INVALID_ARGUMENT");
+      grpc::Status status;
+      std::vector<pdfv1::PageRaster> rasters = RenderDocument(
+          stub.get(), frames, 9.0, pdfv1::PIXEL_FORMAT_RGBA8,
+          std::make_pair(bad.begin, bad.end), &status);
+      Check(status.error_code() == grpc::INVALID_ARGUMENT && rasters.empty(),
+            std::string("Render range ") + bad.what + " is INVALID_ARGUMENT");
+    }
+    struct GoodRange {
+      uint32_t begin;
+      uint32_t end;
+      std::vector<uint32_t> pages;
+      const char* what;
+    };
+    for (const GoodRange& good :
+         {GoodRange{0u, 4294967295u, {0, 1, 2, 3, 4, 5, 6, 7}, "0 to 2^32-1"},
+          GoodRange{6u, 100u, {6, 7}, "an end past the last page"},
+          GoodRange{9u, 12u, {}, "past the last page"},
+          GoodRange{2147483648u, 2147483649u, {}, "begin 2^31"},
+          GoodRange{2147483648u, 4294967295u, {}, "begin 2^31, end 2^32-1"}}) {
+      const std::string range = std::string("range ") + good.what + ": ";
+      const uint64_t before = service.decoded_pages();
+      ParseResult parsed =
+          ParseDocument(stub.get(), frames, {pdfv1::PDF_FAMILY_TEXT_CELLS},
+                        std::make_pair(good.begin, good.end));
+      std::vector<uint32_t> streamed;
+      for (const auto& [index, chunk] : parsed.pages) streamed.push_back(index);
+      Check(parsed.status.ok() && parsed.header.pages_size() == 8 &&
+                parsed.trailer.has_value() &&
+                parsed.trailer->warnings_size() == 0,
+            range + "Parse finishes OK with no warning");
+      Check(streamed == good.pages, range + "Parse streams exactly its pages");
+      grpc::Status status;
+      std::vector<pdfv1::PageRaster> rasters = RenderDocument(
+          stub.get(), frames, 9.0, pdfv1::PIXEL_FORMAT_RGBA8,
+          std::make_pair(good.begin, good.end), &status);
+      std::vector<uint32_t> rendered;
+      for (const auto& raster : rasters) rendered.push_back(raster.page_index());
+      Check(status.ok() && rendered == good.pages,
+            range + "Render rasters exactly its pages");
+      Check(service.decoded_pages() - before == 2 * good.pages.size(),
+            range + "only the selected pages are decoded");
+    }
+  }
+
   // A page the engine cannot decode (an operator short of operands throws
   // in the engine) still has its PageInfo, and the trailer says why its
   // chunk is missing.
