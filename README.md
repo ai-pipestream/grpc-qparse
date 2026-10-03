@@ -26,7 +26,9 @@ A font id names one font for the whole stream: a cell's `font_id` is the
 id of the `EmbeddedFont` that carries its program, and two subsets that
 share a name but not a program get two ids. `PDF_FAMILY_FONTS` sends the
 font table; programs are decoded and sent, once each, only when
-`PDF_FAMILY_EMBEDDED_FONTS` is requested.
+`PDF_FAMILY_EMBEDDED_FONTS` is requested. A `FontRef` is marked
+`embedded` whenever its font dictionary carries a program (`/FontFile`,
+`/FontFile2` or `/FontFile3`), whether or not the call decodes it.
 
 The engine is safe to use concurrently through independent per-request
 decoder instances, so the service is plain thread-per-request; there is no

@@ -158,6 +158,109 @@ QPDFObjectHandle BoxArray(const std::array<double, 4>& box) {
       QPDFObjectHandle::Rectangle(box[0], box[1], box[2], box[3]));
 }
 
+// A font as the engine names it in cells and text instructions: its
+// resource key together with the descriptor's /FontName, falling back to
+// the descendant's descriptor, /Name and /BaseFont in the engine's order
+// (page_font.h init_font_name and init_base_font).
+using FontKey = std::pair<std::string, std::string>;
+
+std::optional<std::string> NameOrString(QPDFObjectHandle object) {
+  if (object.isName()) return object.getName();
+  if (object.isString()) return object.getUTF8Value();
+  return std::nullopt;
+}
+
+QPDFObjectHandle DictionaryKey(QPDFObjectHandle dictionary,
+                               const char* key) {
+  return dictionary.isDictionary() ? dictionary.getKey(key)
+                                   : QPDFObjectHandle::newNull();
+}
+
+QPDFObjectHandle DescendantFont(QPDFObjectHandle font) {
+  QPDFObjectHandle descendants = DictionaryKey(font, "/DescendantFonts");
+  if (descendants.isArray() && descendants.getArrayNItems() > 0) {
+    return descendants.getArrayItem(0);
+  }
+  return QPDFObjectHandle::newNull();
+}
+
+std::string EngineFontName(QPDFObjectHandle font) {
+  const QPDFObjectHandle descendant = DescendantFont(font);
+  for (QPDFObjectHandle candidate :
+       {DictionaryKey(DictionaryKey(font, "/FontDescriptor"), "/FontName"),
+        DictionaryKey(DictionaryKey(descendant, "/FontDescriptor"),
+                      "/FontName"),
+        DictionaryKey(font, "/Name"), DictionaryKey(font, "/BaseFont"),
+        DictionaryKey(descendant, "/BaseFont")}) {
+    if (auto name = NameOrString(candidate)) return *name;
+  }
+  return "null";
+}
+
+// Whether a font dictionary embeds its program: a /FontFile, /FontFile2
+// or /FontFile3 stream on its descriptor or its Type0 descendant's, or on
+// either dictionary itself, wherever the engine looks for one
+// (page_font.h init_font_program). Read from the dictionaries alone, so it
+// holds whether or not the call decodes programs.
+bool EmbedsProgram(QPDFObjectHandle font) {
+  auto has_program = [](QPDFObjectHandle dictionary) {
+    for (const char* key : {"/FontFile", "/FontFile2", "/FontFile3"}) {
+      if (DictionaryKey(dictionary, key).isStream()) return true;
+    }
+    return false;
+  };
+  const QPDFObjectHandle descendant = DescendantFont(font);
+  return has_program(DictionaryKey(font, "/FontDescriptor")) ||
+         has_program(DictionaryKey(descendant, "/FontDescriptor")) ||
+         has_program(font) || has_program(descendant);
+}
+
+// Every resource dictionary a page can draw from: its own, and those of
+// the form XObjects, tiling patterns and Type3 fonts it reaches, each
+// once. A worklist rather than recursion, so a deep chain of nested forms
+// cannot exhaust the stack.
+std::vector<QPDFObjectHandle> ReachableResources(QPDFObjectHandle resources) {
+  std::vector<QPDFObjectHandle> found;
+  std::vector<QPDFObjectHandle> pending = {resources};
+  std::set<QPDFObjGen> seen;
+  // Direct objects cannot form a cycle; an indirect one is visited once.
+  auto first_visit = [&seen](QPDFObjectHandle object) {
+    return !object.isIndirect() || seen.insert(object.getObjGen()).second;
+  };
+  while (!pending.empty()) {
+    QPDFObjectHandle current = pending.back();
+    pending.pop_back();
+    if (!current.isDictionary() || !first_visit(current)) continue;
+    found.push_back(current);
+    for (const char* category : {"/Font", "/XObject", "/Pattern"}) {
+      QPDFObjectHandle entries = current.getKey(category);
+      if (!entries.isDictionary()) continue;
+      for (const std::string& key : entries.getKeys()) {
+        QPDFObjectHandle owner = entries.getKey(key);
+        if (owner.isStream()) owner = owner.getDict();
+        if (!owner.isDictionary() || !first_visit(owner)) continue;
+        pending.push_back(owner.getKey("/Resources"));
+      }
+    }
+  }
+  return found;
+}
+
+// The fonts with an embedded program among those a page can draw with,
+// in every resource dictionary it reaches.
+std::set<FontKey> EmbeddedFontsOf(QPDFObjectHandle resources) {
+  std::set<FontKey> embedded;
+  for (QPDFObjectHandle reachable : ReachableResources(resources)) {
+    QPDFObjectHandle fonts = reachable.getKey("/Font");
+    if (!fonts.isDictionary()) continue;
+    for (const std::string& key : fonts.getKeys()) {
+      QPDFObjectHandle font = fonts.getKey(key);
+      if (EmbedsProgram(font)) embedded.emplace(key, EngineFontName(font));
+    }
+  }
+  return embedded;
+}
+
 // The document's pages for Parse and Render, on a qpdf handle of the
 // call's own beside the engine's document decoder. The inventory comes
 // from the page dictionaries without decoding any content; a page's
@@ -186,6 +289,14 @@ class DocumentPages {
 
   const PageGeometry& geometry(int index) const {
     return geometry_.at(static_cast<size_t>(index));
+  }
+
+  // The fonts the page can draw with that embed their programs. Call it
+  // after Decode, which pins inherited resources on the page.
+  std::set<FontKey> EmbeddedFonts(int index) const {
+    QPDFObjectHandle page = pages_.at(static_cast<size_t>(index));
+    return EmbeddedFontsOf(
+        QPDFPageObjectHelper(page).getAttribute("/Resources", false));
   }
 
   // Decodes one page. The engine reads /CropBox and /Rotate from the page
@@ -448,9 +559,10 @@ using FontProgram = std::shared_ptr<const pdflib::embedded_font_blob>;
 class FontInterner {
  public:
   // Returns the font's id, announcing a font seen for the first time in
-  // new_fonts.
+  // new_fonts, marked embedded when its dictionary embeds a program whether
+  // or not the call decoded it.
   uint32_t Intern(const std::string& engine_name, const FontProgram& program,
-                  pdfv1::FontTableChunk* new_fonts) {
+                  bool embedded, pdfv1::FontTableChunk* new_fonts) {
     std::string name = engine_name;
     if (!name.empty() && name.front() == '/') name.erase(0, 1);
     std::pair<std::string, std::string> key(
@@ -462,7 +574,7 @@ class FontInterner {
     auto* ref = new_fonts->add_fonts();
     ref->set_font_id(id);
     ref->set_base_name(name);
-    if (program != nullptr) ref->set_embedded(true);
+    ref->set_embedded(embedded || program != nullptr);
     return id;
   }
 
@@ -476,7 +588,9 @@ class FontInterner {
 // pdf_render_instructions::iterate_over_instructions.
 class PageFonts {
  public:
-  using Key = std::pair<std::string, std::string>;
+  using Key = FontKey;
+
+  explicit PageFonts(std::set<Key> embedded) : embedded_(std::move(embedded)) {}
 
   void set_size(const pdflib::size_instruction&) {}
   void render_widget(pdflib::text_widget_instruction&) {}
@@ -498,9 +612,16 @@ class PageFonts {
     return it != fonts_.end() ? it->second : nullptr;
   }
 
+  // Whether the font's dictionary embeds a program, decoded or not.
+  bool Embedded(const std::string& font_key,
+                const std::string& font_name) const {
+    return embedded_.count(Key(font_key, font_name)) > 0;
+  }
+
   const std::map<Key, FontProgram>& fonts() const { return fonts_; }
 
  private:
+  std::set<Key> embedded_;
   std::map<Key, FontProgram> fonts_;
 };
 
@@ -576,8 +697,9 @@ void FillTextCells(const nlohmann::json& cells, const UserSpaceOffset& offset,
       const std::string key = ifontkey >= 0 && row[ifontkey].is_string()
                                   ? row[ifontkey].get<std::string>()
                                   : std::string();
-      cell->set_font_id(
-          fonts->Intern(name, page_fonts.ProgramOf(key, name), new_fonts));
+      cell->set_font_id(fonts->Intern(name, page_fonts.ProgramOf(key, name),
+                                      page_fonts.Embedded(key, name),
+                                      new_fonts));
     }
     ++*cell_count;
   }
@@ -821,7 +943,8 @@ void CollectPrograms(const PageFonts& page_fonts, FontInterner* fonts,
                      std::vector<pdfv1::EmbeddedFont>* out) {
   for (const auto& [key, program] : page_fonts.fonts()) {
     if (program == nullptr || !program->has_bytes()) continue;
-    const uint32_t id = fonts->Intern(key.second, program, new_fonts);
+    const uint32_t id =
+        fonts->Intern(key.second, program, /*embedded=*/true, new_fonts);
     if (!sent->insert(id).second) continue;
     pdfv1::EmbeddedFont font;
     font.set_font_id(id);
@@ -1156,8 +1279,8 @@ grpc::Status QparseServiceImpl::Parse(
         const UserSpaceOffset offset{media[0], media[1]};
 
         // Which program each of the page's fonts draws with, so a cell and
-        // its program get the same font id.
-        PageFonts page_fonts;
+        // its program get the same font id, and which fonts embed one.
+        PageFonts page_fonts(loaded.pages->EmbeddedFonts(i));
         if (want_fonts || want_programs) {
           decoder->get_instructions().iterate_over_instructions(page_fonts);
         }
@@ -1189,7 +1312,9 @@ grpc::Status QparseServiceImpl::Parse(
         // requested or not; programs go only to a call that asked for them.
         if (want_fonts) {
           for (const auto& [key, program] : page_fonts.fonts()) {
-            fonts.Intern(key.second, program, &new_fonts);
+            fonts.Intern(key.second, program,
+                         page_fonts.Embedded(key.first, key.second),
+                         &new_fonts);
           }
         }
         if (want_programs) {

@@ -496,6 +496,16 @@ int main(int argc, char** argv) {
     Check(fonts_only.status.ok() && !fonts_only.fonts.empty() &&
               fonts_only.embedded.empty(),
           "a FONTS-only call lists the fonts, without cells or programs");
+    // embedded says whether the document embeds the program, read from the
+    // descriptor, whether or not the call asked for the programs.
+    for (const auto& [id, font] : fonts_only.fonts) {
+      Check(font.embedded(), "a FONTS-only call marks " + font.base_name() +
+                                 " embedded");
+    }
+    for (const auto& [id, font] : no_programs.fonts) {
+      Check(font.embedded(), "a call without programs marks " +
+                                 font.base_name() + " embedded");
+    }
 
     // rich.pdf, the way gRParse asks: cells and the font table, no programs.
     ParseResult rich_fonts = ParseDocument(
@@ -509,8 +519,24 @@ int main(int argc, char** argv) {
     Check(embedded_cell != nullptr &&
               rich_fonts.fonts.count(embedded_cell->font_id()) == 1 &&
               rich_fonts.fonts[embedded_cell->font_id()].base_name() ==
-                  "UbuntuMono",
-          "rich.pdf's embedded-font cell resolves to UbuntuMono");
+                  "UbuntuMono" &&
+              rich_fonts.fonts[embedded_cell->font_id()].embedded(),
+          "rich.pdf's embedded-font cell resolves to UbuntuMono, embedded");
+    const pdfv1::TextCell* standard_cell =
+        rich_fonts.pages.count(0) ? FindCell(rich_fonts.pages[0], "Tagged")
+                                  : nullptr;
+    Check(standard_cell != nullptr &&
+              rich_fonts.fonts.count(standard_cell->font_id()) == 1 &&
+              !rich_fonts.fonts[standard_cell->font_id()].embedded(),
+          "rich.pdf's standard 14 font is not marked embedded");
+    ParseResult rich_fonts_only = ParseDocument(
+        stub.get(), rich, {pdfv1::PDF_FAMILY_FONTS}, std::nullopt);
+    bool ubuntu_embedded = false;
+    for (const auto& [id, font] : rich_fonts_only.fonts) {
+      if (font.base_name() == "UbuntuMono") ubuntu_embedded = font.embedded();
+    }
+    Check(rich_fonts_only.status.ok() && ubuntu_embedded,
+          "a FONTS-only call on rich.pdf marks UbuntuMono embedded");
   }
 
   // A link whose action is not a URI is not emitted: the engine leaves its
