@@ -10,12 +10,20 @@ What this backend is for: reading-order text cells (its sanitizers merge
 raw chars into model-ready cells with direction, space width and rendering
 mode), vector shapes, embedded font programs, plus the tier 0 floor: typed
 load status, page inventory, and blend2d page rasters (RGBA8, BGRA8, RGB8,
-BGR8 or GRAY8, as requested). Placed
-images, hyperlinks, form-field widgets, the outline, and the XMP packet
-ride along. Families the engine's public surface does not expose
-(annotations as typed data, encryption details, attachments, signatures,
-JavaScript, the structure tree, thumbnails, and its internal resource
-dictionaries) are reported unsupported in `Probe`, each with a reason.
+BGR8 or GRAY8, as requested). Placed images, hyperlinks, form-field
+widgets, the outline, and the XMP packet ride along. Families the engine's
+public surface does not expose (annotations as typed data, encryption
+details, attachments, signatures, JavaScript, the structure tree,
+thumbnails, and its internal resource dictionaries) are reported
+unsupported in `Probe`, each with a reason.
+
+Every geometry is in unrotated PDF user space, the contract's frame, with
+`PageInfo` carrying the page's true `/Rotate` and its MediaBox and CropBox.
+A font id names one font for the whole stream: a cell's `font_id` is the
+id of the `EmbeddedFont` that carries its program, and two subsets that
+share a name but not a program get two ids. `PDF_FAMILY_FONTS` sends the
+font table; programs are decoded and sent, once each, only when
+`PDF_FAMILY_EMBEDDED_FONTS` is requested.
 
 The engine is safe to use concurrently through independent per-request
 decoder instances, so the service is plain thread-per-request; there is no

@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -396,28 +397,76 @@ int ColumnIndex(const nlohmann::json& header, const std::string& name) {
   return -1;
 }
 
-// Assigns stable ids to font names within one stream.
+using FontProgram = std::shared_ptr<const pdflib::embedded_font_blob>;
+
+// Assigns stable font ids within one stream. A font is the name the engine
+// gives cells and text instructions alike (the descriptor's /FontName,
+// else /BaseFont), together with the content key of its embedded program
+// when the call decoded programs: two subsets that share a name but not a
+// program stay apart, and one font used on many pages keeps one id.
 class FontInterner {
  public:
-  uint32_t Intern(const std::string& name, bool* is_new) {
-    auto it = ids_.find(name);
-    if (it != ids_.end()) {
-      *is_new = false;
-      return it->second;
-    }
-    uint32_t id = static_cast<uint32_t>(ids_.size());
-    ids_.emplace(name, id);
-    *is_new = true;
+  // Returns the font's id, announcing a font seen for the first time in
+  // new_fonts.
+  uint32_t Intern(const std::string& engine_name, const FontProgram& program,
+                  pdfv1::FontTableChunk* new_fonts) {
+    std::string name = engine_name;
+    if (!name.empty() && name.front() == '/') name.erase(0, 1);
+    std::pair<std::string, std::string> key(
+        name, program != nullptr ? program->get_cache_key() : std::string());
+    auto it = ids_.find(key);
+    if (it != ids_.end()) return it->second;
+    const auto id = static_cast<uint32_t>(ids_.size());
+    ids_.emplace(std::move(key), id);
+    auto* ref = new_fonts->add_fonts();
+    ref->set_font_id(id);
+    ref->set_base_name(name);
+    if (program != nullptr) ref->set_embedded(true);
     return id;
   }
 
  private:
-  std::map<std::string, uint32_t> ids_;
+  std::map<std::pair<std::string, std::string>, uint32_t> ids_;
+};
+
+// The fonts one page draws text with, keyed the way the engine keys a
+// cell's font (its resource name and font name), each with its embedded
+// program when the call decoded programs. Duck-typed against
+// pdf_render_instructions::iterate_over_instructions.
+class PageFonts {
+ public:
+  using Key = std::pair<std::string, std::string>;
+
+  void set_size(const pdflib::size_instruction&) {}
+  void render_widget(pdflib::text_widget_instruction&) {}
+  void render_bitmap(pdflib::bitmap_instruction&) {}
+  void render_shape(pdflib::shape_instruction&) {}
+  void render_shading(pdflib::shading_instruction&) {}
+
+  void render_text(pdflib::text_instruction& instr) {
+    fonts_.emplace(Key(instr.get_font_key(), instr.get_font_name()),
+                   instr.has_embedded_font() ? instr.get_embedded_font()
+                                             : nullptr);
+  }
+
+  // The program a cell's font draws with; null when there is none or
+  // programs were not decoded.
+  FontProgram ProgramOf(const std::string& font_key,
+                        const std::string& font_name) const {
+    auto it = fonts_.find(Key(font_key, font_name));
+    return it != fonts_.end() ? it->second : nullptr;
+  }
+
+  const std::map<Key, FontProgram>& fonts() const { return fonts_; }
+
+ private:
+  std::map<Key, FontProgram> fonts_;
 };
 
 void FillTextCells(const nlohmann::json& cells, const UserSpaceOffset& offset,
-                   FontInterner* fonts, pdfv1::PageChunk* chunk,
-                   pdfv1::FontTableChunk* new_fonts, uint64_t* cell_count) {
+                   const PageFonts& page_fonts, FontInterner* fonts,
+                   pdfv1::PageChunk* chunk, pdfv1::FontTableChunk* new_fonts,
+                   uint64_t* cell_count) {
   if (!cells.contains("header") || !cells.contains("data")) return;
   const auto& header = cells["header"];
   const int ix0 = ColumnIndex(header, "x0");
@@ -429,6 +478,7 @@ void FillTextCells(const nlohmann::json& cells, const UserSpaceOffset& offset,
   const int imode = ColumnIndex(header, "rendering-mode");
   const int ispace = ColumnIndex(header, "space-width");
   const int ifont = ColumnIndex(header, "font-name");
+  const int ifontkey = ColumnIndex(header, "font-key");
   const int iltr = ColumnIndex(header, "left_to_right");
   const int iwidget = ColumnIndex(header, "widget");
   for (const auto& row : cells["data"]) {
@@ -469,16 +519,12 @@ void FillTextCells(const nlohmann::json& cells, const UserSpaceOffset& offset,
       }
     }
     if (ifont >= 0 && row[ifont].is_string()) {
-      std::string name = row[ifont].get<std::string>();
-      if (!name.empty() && name.front() == '/') name.erase(0, 1);
-      bool is_new = false;
-      uint32_t id = fonts->Intern(name, &is_new);
-      cell->set_font_id(id);
-      if (is_new) {
-        auto* ref = new_fonts->add_fonts();
-        ref->set_font_id(id);
-        ref->set_base_name(name);
-      }
+      const std::string& name = row[ifont].get_ref<const std::string&>();
+      const std::string key = ifontkey >= 0 && row[ifontkey].is_string()
+                                  ? row[ifontkey].get<std::string>()
+                                  : std::string();
+      cell->set_font_id(
+          fonts->Intern(name, page_fonts.ProgramOf(key, name), new_fonts));
     }
     ++*cell_count;
   }
@@ -673,66 +719,51 @@ void FillOutlineNode(const nlohmann::json& entry, pdfv1::OutlineNode* node) {
   }
 }
 
-// Instruction visitor that collects embedded font programs. Duck-typed
-// against pdf_render_instructions::iterate_over_instructions.
-class EmbeddedFontCollector {
- public:
-  EmbeddedFontCollector(FontInterner* fonts, pdfv1::FontTableChunk* new_fonts,
-                        std::vector<pdfv1::EmbeddedFont>* out)
-      : fonts_(fonts), new_fonts_(new_fonts), out_(out) {}
-
-  void set_size(const pdflib::size_instruction&) {}
-  void render_widget(pdflib::text_widget_instruction&) {}
-  void render_bitmap(pdflib::bitmap_instruction&) {}
-  void render_shape(pdflib::shape_instruction&) {}
-  void render_shading(pdflib::shading_instruction&) {}
-
-  void render_text(pdflib::text_instruction& instr) {
-    if (!instr.has_embedded_font()) return;
-    const auto& blob = instr.get_embedded_font();
-    if (blob == nullptr || !blob->has_bytes()) return;
-    std::string name = blob->get_base_font().empty() ? blob->get_font_name()
-                                                     : blob->get_base_font();
-    if (!name.empty() && name.front() == '/') name.erase(0, 1);
-    bool is_new = false;
-    uint32_t id = fonts_->Intern(name, &is_new);
-    if (is_new) {
-      auto* ref = new_fonts_->add_fonts();
-      ref->set_font_id(id);
-      ref->set_base_name(name);
-      ref->set_embedded(true);
-    }
-    if (!emitted_.insert(id).second) return;
-    pdfv1::EmbeddedFont program;
-    program.set_font_id(id);
-    const auto& bytes = blob->get_bytes();
-    program.set_program(std::string(bytes->begin(), bytes->end()));
-    if (blob->get_source_key() == "/FontFile") {
-      program.set_format(pdfv1::FONT_PROGRAM_FORMAT_TYPE1);
-    } else if (blob->get_source_key() == "/FontFile2") {
-      program.set_format(pdfv1::FONT_PROGRAM_FORMAT_TRUETYPE);
-    } else if (blob->get_source_key() == "/FontFile3") {
-      program.set_format(pdfv1::FONT_PROGRAM_FORMAT_CFF);
-    }
-    out_->push_back(std::move(program));
+pdfv1::FontProgramFormat ProgramFormat(pdflib::embedded_font_format format) {
+  switch (format) {
+    case pdflib::embedded_font_format::TYPE1:
+      return pdfv1::FONT_PROGRAM_FORMAT_TYPE1;
+    case pdflib::embedded_font_format::TRUETYPE:
+      return pdfv1::FONT_PROGRAM_FORMAT_TRUETYPE;
+    case pdflib::embedded_font_format::TYPE1C:
+    case pdflib::embedded_font_format::CID_TYPE0C:
+      return pdfv1::FONT_PROGRAM_FORMAT_CFF;
+    case pdflib::embedded_font_format::OPENTYPE:
+      return pdfv1::FONT_PROGRAM_FORMAT_OPENTYPE;
+    default:
+      return pdfv1::FONT_PROGRAM_FORMAT_UNSPECIFIED;
   }
+}
 
- private:
-  FontInterner* fonts_;
-  pdfv1::FontTableChunk* new_fonts_;
-  std::vector<pdfv1::EmbeddedFont>* out_;
-  std::set<uint32_t> emitted_;
-};
+// The embedded programs of the fonts a page draws with, under the ids
+// their cells carry, each sent once per stream.
+void CollectPrograms(const PageFonts& page_fonts, FontInterner* fonts,
+                     pdfv1::FontTableChunk* new_fonts,
+                     std::set<uint32_t>* sent,
+                     std::vector<pdfv1::EmbeddedFont>* out) {
+  for (const auto& [key, program] : page_fonts.fonts()) {
+    if (program == nullptr || !program->has_bytes()) continue;
+    const uint32_t id = fonts->Intern(key.second, program, new_fonts);
+    if (!sent->insert(id).second) continue;
+    pdfv1::EmbeddedFont font;
+    font.set_font_id(id);
+    font.set_format(ProgramFormat(program->get_format()));
+    const auto& bytes = program->get_bytes();
+    font.set_program(std::string(bytes->begin(), bytes->end()));
+    out->push_back(std::move(font));
+  }
+}
 
 // Parse reports geometry and text, never image samples, so image XObjects
-// are measured but not decoded. The page boundary is the MediaBox: the
-// engine drops every cell that is not wholly inside its boundary, and a
-// cell that only straddles the CropBox edge is still on the page.
-pdflib::decode_config ParseDecodeConfig() {
+// are measured but not decoded, and it decodes font programs only for a
+// call that asks for them. The page boundary is the MediaBox: the engine
+// drops every cell that is not wholly inside its boundary, and a cell that
+// only straddles the CropBox edge is still on the page.
+pdflib::decode_config ParseDecodeConfig(bool font_programs) {
   pdflib::decode_config config;
   config.page_boundary = "media_box";
   config.extract_bitmap_pixels = false;
-  config.extract_font_programs = true;
+  config.extract_font_programs = font_programs;
   return config;
 }
 
@@ -981,9 +1012,13 @@ grpc::Status QparseServiceImpl::Parse(
     end = std::min<int>(static_cast<int>(request->pages().end()), page_count);
   }
 
-  const pdflib::decode_config config = ParseDecodeConfig();
+  const bool want_fonts = WantFamily(*request, pdfv1::PDF_FAMILY_FONTS);
+  const bool want_programs =
+      WantFamily(*request, pdfv1::PDF_FAMILY_EMBEDDED_FONTS);
+  const pdflib::decode_config config = ParseDecodeConfig(want_programs);
   const bool want_page_items = WantPageItems(*request);
   FontInterner fonts;
+  std::set<uint32_t> programs_sent;
   std::map<pdfv1::PdfFamily, uint64_t> counts;
   counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] = static_cast<uint64_t>(page_count);
   pdfv1::ParseResponse trailer_msg;
@@ -1010,12 +1045,19 @@ grpc::Status QparseServiceImpl::Parse(
             decoder->get_page_dimension().get_media_bbox();
         const UserSpaceOffset offset{media[0], media[1]};
 
+        // Which program each of the page's fonts draws with, so a cell and
+        // its program get the same font id.
+        PageFonts page_fonts;
+        if (want_fonts || want_programs) {
+          decoder->get_instructions().iterate_over_instructions(page_fonts);
+        }
+
         const auto& sanitized = pj.contains("sanitized") ? pj["sanitized"] : pj;
         const auto& original = pj.contains("original") ? pj["original"] : pj;
         if (WantFamily(*request, pdfv1::PDF_FAMILY_TEXT_CELLS) &&
             sanitized.contains("cells")) {
-          FillTextCells(sanitized["cells"], offset, &fonts, chunk, &new_fonts,
-                        &counts[pdfv1::PDF_FAMILY_TEXT_CELLS]);
+          FillTextCells(sanitized["cells"], offset, page_fonts, &fonts, chunk,
+                        &new_fonts, &counts[pdfv1::PDF_FAMILY_TEXT_CELLS]);
         }
         if (WantFamily(*request, pdfv1::PDF_FAMILY_VECTOR_SHAPES) &&
             sanitized.contains("shapes")) {
@@ -1033,10 +1075,16 @@ grpc::Status QparseServiceImpl::Parse(
             original.contains("widgets")) {
           FillFormFields(original["widgets"], chunk);
         }
-        if (WantFamily(*request, pdfv1::PDF_FAMILY_FONTS) ||
-            WantFamily(*request, pdfv1::PDF_FAMILY_EMBEDDED_FONTS)) {
-          EmbeddedFontCollector collector(&fonts, &new_fonts, &embedded);
-          decoder->get_instructions().iterate_over_instructions(collector);
+        // The font table lists every font the page draws with, cells
+        // requested or not; programs go only to a call that asked for them.
+        if (want_fonts) {
+          for (const auto& [key, program] : page_fonts.fonts()) {
+            fonts.Intern(key.second, program, &new_fonts);
+          }
+        }
+        if (want_programs) {
+          CollectPrograms(page_fonts, &fonts, &new_fonts, &programs_sent,
+                          &embedded);
         }
       } catch (const std::exception& e) {
         // The page is skipped, and said so in the trailer. Font ids it

@@ -435,6 +435,84 @@ int main(int argc, char** argv) {
     Check(counts[pdfv1::PDF_FAMILY_TEXT_CELLS] >= 1, "trailer counts cells");
   }
 
+  // Font ids: a cell and its embedded program share one id even when the
+  // font's /BaseFont differs from its /FontName, two subsets that share a
+  // name but not a program stay apart, and programs go only to a call that
+  // asks for EMBEDDED_FONTS.
+  {
+    const std::string fonts_pdf = ReadFile(fixture_dir + "/fonts.pdf");
+    Check(!fonts_pdf.empty(), "fonts.pdf read");
+    ParseResult full = ParseDocument(
+        stub.get(), fonts_pdf,
+        {pdfv1::PDF_FAMILY_TEXT_CELLS, pdfv1::PDF_FAMILY_FONTS,
+         pdfv1::PDF_FAMILY_EMBEDDED_FONTS},
+        std::nullopt);
+    Check(full.status.ok(), "fonts.pdf Parse finished OK");
+    const pdfv1::TextCell* first =
+        full.pages.count(0) ? FindCell(full.pages[0], "First") : nullptr;
+    const pdfv1::TextCell* second =
+        full.pages.count(1) ? FindCell(full.pages[1], "Second") : nullptr;
+    Check(first != nullptr && second != nullptr && first->has_font_id() &&
+              second->has_font_id(),
+          "fonts.pdf cells carry font ids");
+    if (first != nullptr && second != nullptr) {
+      Check(first->font_id() != second->font_id(),
+            "two subsets sharing a name but not a program get two ids");
+      std::map<uint32_t, int> programs;
+      for (const auto& program : full.embedded) ++programs[program.font_id()];
+      Check(full.embedded.size() == 2 && programs[first->font_id()] == 1 &&
+                programs[second->font_id()] == 1,
+            "each cell's font id names its own embedded program, once");
+      for (uint32_t id : {first->font_id(), second->font_id()}) {
+        const auto it = full.fonts.find(id);
+        Check(it != full.fonts.end() &&
+                  it->second.base_name() == "ABCDEF+SharedSans-Bold" &&
+                  it->second.embedded(),
+              "the font entry is the descriptor's name, marked embedded");
+      }
+      for (const auto& program : full.embedded) {
+        Check(program.format() == pdfv1::FONT_PROGRAM_FORMAT_TRUETYPE &&
+                  !program.program().empty(),
+              "the program is the /FontFile2 TrueType bytes");
+      }
+    }
+
+    ParseResult no_programs = ParseDocument(
+        stub.get(), fonts_pdf,
+        {pdfv1::PDF_FAMILY_TEXT_CELLS, pdfv1::PDF_FAMILY_FONTS}, std::nullopt);
+    Check(no_programs.status.ok() && no_programs.embedded.empty(),
+          "FONTS without EMBEDDED_FONTS sends no program");
+    const pdfv1::TextCell* cell = no_programs.pages.count(0)
+                                      ? FindCell(no_programs.pages[0], "First")
+                                      : nullptr;
+    Check(cell != nullptr && cell->has_font_id() &&
+              no_programs.fonts.count(cell->font_id()) == 1 &&
+              no_programs.fonts[cell->font_id()].base_name() ==
+                  "ABCDEF+SharedSans-Bold",
+          "without programs a cell still resolves in the font table");
+
+    ParseResult fonts_only = ParseDocument(
+        stub.get(), fonts_pdf, {pdfv1::PDF_FAMILY_FONTS}, std::nullopt);
+    Check(fonts_only.status.ok() && !fonts_only.fonts.empty() &&
+              fonts_only.embedded.empty(),
+          "a FONTS-only call lists the fonts, without cells or programs");
+
+    // rich.pdf, the way gRParse asks: cells and the font table, no programs.
+    ParseResult rich_fonts = ParseDocument(
+        stub.get(), rich,
+        {pdfv1::PDF_FAMILY_TEXT_CELLS, pdfv1::PDF_FAMILY_FONTS}, std::nullopt);
+    Check(rich_fonts.status.ok() && rich_fonts.embedded.empty(),
+          "rich.pdf with FONTS only sends no program");
+    const pdfv1::TextCell* embedded_cell =
+        rich_fonts.pages.count(0) ? FindCell(rich_fonts.pages[0], "Embedded")
+                                  : nullptr;
+    Check(embedded_cell != nullptr &&
+              rich_fonts.fonts.count(embedded_cell->font_id()) == 1 &&
+              rich_fonts.fonts[embedded_cell->font_id()].base_name() ==
+                  "UbuntuMono",
+          "rich.pdf's embedded-font cell resolves to UbuntuMono");
+  }
+
   // Render hello.pdf at 72 DPI.
   {
     grpc::ClientContext ctx;
