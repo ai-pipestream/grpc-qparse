@@ -23,10 +23,11 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   expand a truncated engine commit hash from memory; take it from
   `git rev-parse`.
 - Page geometry follows the contract frame: every cell, quad, shape, image,
-  link and widget is in unrotated PDF user space (absolute, not shifted to
-  the CropBox origin), `PageInfo.rotation_degrees` is the page's own or
-  inherited `/Rotate`, and `media_box`/`crop_box` are the unrotated boxes.
-  gRParse's `PageFrame` maps that frame onto the rendered page. The engine
+  link and widget is in unrotated PDF user space shifted so the CropBox's
+  lower-left corner is (0, 0), `PageInfo.page_space` is
+  `PAGE_SPACE_CROP_BOX` on every page, `PageInfo.rotation_degrees` is the
+  page's own or inherited `/Rotate`, and `media_box`/`crop_box` are the
+  unrotated boxes as stored (absolute). gRParse's `PageFrame` maps that frame onto the rendered page. The engine
   would rotate items into display orientation and drop the angle, so pages
   are decoded through the service's own qpdf handle (`DocumentPages` in
   `src/qparse_service_impl.cpp`) with `/Rotate` held at 0 and the inherited

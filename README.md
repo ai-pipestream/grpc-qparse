@@ -20,8 +20,10 @@ details, attachments, signatures, JavaScript, the structure tree,
 thumbnails, and its internal resource dictionaries) are reported
 unsupported in `Probe`, each with a reason.
 
-Every geometry is in unrotated PDF user space, the contract's frame, with
-`PageInfo` carrying the page's true `/Rotate` and its MediaBox and CropBox.
+Every geometry is in the contract's frame: unrotated PDF user space
+shifted so the CropBox's lower-left corner is (0, 0). `PageInfo` says so
+with `page_space = PAGE_SPACE_CROP_BOX` and carries the page's true
+`/Rotate` and its MediaBox and CropBox as stored.
 A font id names one font for the whole stream: a cell's `font_id` is the
 id of the `EmbeddedFont` that carries its program, and two subsets that
 share a name but not a program get two ids. `PDF_FAMILY_FONTS` sends the

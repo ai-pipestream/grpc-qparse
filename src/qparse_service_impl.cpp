@@ -375,8 +375,8 @@ class DocumentPages {
   // dictionary alone, never through the page tree, and on a rotated page it
   // turns every cell, shape and image into display orientation and drops
   // the angle. Here it decodes the page with the boxes resolved above and
-  // /Rotate 0, so every item stays in unrotated user space, the contract's
-  // frame; Render passes the rotation to the rasterizer instead. The edits
+  // /Rotate 0, so every item stays unrotated, as the contract's frame wants;
+  // Render passes the rotation to the rasterizer instead. The edits
   // touch only this call's qpdf objects, never the bytes.
   //
   // When the call decodes image samples, max_image_pixels bounds every image
@@ -602,7 +602,8 @@ void SetBox(const std::array<double, 4>& corners, pdfv1::BoundingBox* box) {
 }
 
 // PageInfo straight from the page dictionary: the size after /Rotate, the
-// true (inherited) /Rotate, and the boxes in unrotated user space.
+// true (inherited) /Rotate, and the boxes as stored, in unrotated user
+// space. Every other geometry on the page is relative to the CropBox.
 void FillPageInfo(const PageGeometry& geometry, int index,
                   pdfv1::PageInfo* info) {
   info->set_page_index(static_cast<uint32_t>(index));
@@ -611,12 +612,16 @@ void FillPageInfo(const PageGeometry& geometry, int index,
   info->set_rotation_degrees(geometry.rotation);
   SetBox(geometry.media_box, info->mutable_media_box());
   SetBox(geometry.crop_box, info->mutable_crop_box());
+  info->set_page_space(pdfv1::PAGE_SPACE_CROP_BOX);
 }
 
-// Where a decoded page's sanitized cells, shapes and images sit: the engine
-// moves them to the origin of its page boundary (the MediaBox, see
-// ParseDecodeConfig), and the contract wants them back in user space.
-struct UserSpaceOffset {
+// The shift that puts a coordinate into the contract frame, unrotated user
+// space with the CropBox's lower-left corner at (0, 0). The engine moves
+// sanitized cells, shapes and images to the origin of its page boundary
+// (the MediaBox, see ParseDecodeConfig), so they move by the MediaBox
+// origin less the CropBox origin; link and widget rectangles come as
+// stored, in user space, and move by the CropBox origin alone.
+struct PageSpaceOffset {
   double dx = 0.0;
   double dy = 0.0;
 };
@@ -721,7 +726,7 @@ class PageFonts {
   std::map<Key, FontProgram> fonts_;
 };
 
-void FillTextCells(const nlohmann::json& cells, const UserSpaceOffset& offset,
+void FillTextCells(const nlohmann::json& cells, const PageSpaceOffset& offset,
                    const PageFonts& page_fonts, FontInterner* fonts,
                    pdfv1::PageChunk* chunk, pdfv1::FontTableChunk* new_fonts,
                    uint64_t* cell_count) {
@@ -801,7 +806,7 @@ void FillTextCells(const nlohmann::json& cells, const UserSpaceOffset& offset,
   }
 }
 
-void FillShapes(const nlohmann::json& shapes, const UserSpaceOffset& offset,
+void FillShapes(const nlohmann::json& shapes, const PageSpaceOffset& offset,
                 pdfv1::PageChunk* chunk) {
   if (!shapes.is_array()) return;
   for (const auto& s : shapes) {
@@ -867,7 +872,7 @@ void FillShapes(const nlohmann::json& shapes, const UserSpaceOffset& offset,
   }
 }
 
-void FillImages(const nlohmann::json& images, const UserSpaceOffset& offset,
+void FillImages(const nlohmann::json& images, const PageSpaceOffset& offset,
                 pdfv1::PageChunk* chunk) {
   if (!images.contains("header") || !images.contains("data")) return;
   const auto& header = images["header"];
@@ -923,7 +928,8 @@ void FillImages(const nlohmann::json& images, const UserSpaceOffset& offset,
   }
 }
 
-void FillHyperlinks(const nlohmann::json& links, pdfv1::PageChunk* chunk) {
+void FillHyperlinks(const nlohmann::json& links, const PageSpaceOffset& offset,
+                    pdfv1::PageChunk* chunk) {
   if (!links.is_array()) return;
   for (const auto& l : links) {
     // The engine reports every /A link and leaves uri empty for actions
@@ -934,10 +940,11 @@ void FillHyperlinks(const nlohmann::json& links, pdfv1::PageChunk* chunk) {
     if (uri.empty()) continue;
     auto* link = chunk->add_hyperlinks();
     link->set_uri(uri);
-    // The link /Rect as stored: unrotated user space, the cells' frame.
-    SetBox(NumberOr(l, "x0", 0.0), NumberOr(l, "y0", 0.0),
-           NumberOr(l, "x1", 0.0), NumberOr(l, "y1", 0.0),
-           link->mutable_bbox());
+    // The link /Rect as stored, moved into the cells' frame.
+    SetBox(NumberOr(l, "x0", 0.0) + offset.dx,
+           NumberOr(l, "y0", 0.0) + offset.dy,
+           NumberOr(l, "x1", 0.0) + offset.dx,
+           NumberOr(l, "y1", 0.0) + offset.dy, link->mutable_bbox());
   }
 }
 
@@ -970,7 +977,8 @@ pdfv1::FormFieldKind FieldKind(const std::string& type, uint32_t flags) {
 // helper) and reads /AS from the widget itself, the same raw state
 // docling-core exposes as PdfWidget.widget_field_flags and
 // widget_appearance_state.
-void FillFormFields(const nlohmann::json& widgets, pdfv1::PageChunk* chunk) {
+void FillFormFields(const nlohmann::json& widgets,
+                    const PageSpaceOffset& offset, pdfv1::PageChunk* chunk) {
   if (!widgets.is_array()) return;
   for (const auto& w : widgets) {
     if (!w.is_object()) continue;
@@ -999,10 +1007,11 @@ void FillFormFields(const nlohmann::json& widgets, pdfv1::PageChunk* chunk) {
     if (!desc.empty()) field->set_alternate_name(desc);
     std::string state = StringOr(w, "appearance_state");
     if (!state.empty()) field->set_appearance_state(state);
-    // The widget /Rect as stored: unrotated user space, the cells' frame.
-    SetBox(NumberOr(w, "x0", 0.0), NumberOr(w, "y0", 0.0),
-           NumberOr(w, "x1", 0.0), NumberOr(w, "y1", 0.0),
-           field->mutable_rect());
+    // The widget /Rect as stored, moved into the cells' frame.
+    SetBox(NumberOr(w, "x0", 0.0) + offset.dx,
+           NumberOr(w, "y0", 0.0) + offset.dy,
+           NumberOr(w, "x1", 0.0) + offset.dx,
+           NumberOr(w, "y1", 0.0) + offset.dy, field->mutable_rect());
   }
 }
 
@@ -1388,7 +1397,10 @@ grpc::Status QparseServiceImpl::Parse(
         nlohmann::json pj = decoder->get(config);
         const std::array<double, 4> media =
             decoder->get_page_dimension().get_media_bbox();
-        const UserSpaceOffset offset{media[0], media[1]};
+        const std::array<double, 4>& crop =
+            loaded.pages->geometry(i).crop_box;
+        const PageSpaceOffset offset{media[0] - crop[0], media[1] - crop[1]};
+        const PageSpaceOffset stored_offset{-crop[0], -crop[1]};
 
         // Which program each of the page's fonts draws with, so a cell and
         // its program get the same font id, and which fonts embed one.
@@ -1414,11 +1426,11 @@ grpc::Status QparseServiceImpl::Parse(
         }
         if (WantFamily(*request, pdfv1::PDF_FAMILY_HYPERLINKS) &&
             original.contains("hyperlinks")) {
-          FillHyperlinks(original["hyperlinks"], chunk);
+          FillHyperlinks(original["hyperlinks"], stored_offset, chunk);
         }
         if (WantFamily(*request, pdfv1::PDF_FAMILY_FORM_FIELDS) &&
             original.contains("widgets")) {
-          FillFormFields(original["widgets"], chunk);
+          FillFormFields(original["widgets"], stored_offset, chunk);
         }
         // The font table lists every font the page draws with, cells
         // requested or not; programs go only to a call that asked for them.

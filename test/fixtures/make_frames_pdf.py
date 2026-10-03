@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Regenerates frames.pdf, the page-frame fixture: eight Letter pages that
 draw the same things at the same user-space positions and differ only in
-how the page is framed, so every page must report the same geometry.
+how the page is framed, so every page must report the same geometry less
+its CropBox origin.
 
 Each page shows Helvetica 24pt "Frame" at (72, 700) and fills a red 60x30
 rectangle at (300, 500), shifted by the MediaBox origin on page 6 and moved

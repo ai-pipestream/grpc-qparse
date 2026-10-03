@@ -199,16 +199,28 @@ const pdfv1::TextCell* FindCell(const pdfv1::PageChunk& page,
   return nullptr;
 }
 
+// A box drawn at user-space corners, as the contract frame reports it on
+// this page: shifted so the CropBox's lower-left corner is (0, 0).
+std::array<double, 4> CropRelative(const pdfv1::PageInfo& info,
+                                   const std::array<double, 4>& user) {
+  const double x = info.crop_box().x0();
+  const double y = info.crop_box().y0();
+  return {user[0] - x, user[1] - y, user[2] - x, user[3] - y};
+}
+
 // The client's mapping (gRParse src/remote_page_source.cpp, PageFrame):
-// contract boxes are user space before /Rotate, and the rendered page is
-// the CropBox turned clockwise by /Rotate with a top-left origin. Returns
-// {left, top, right, bottom} in pixels at the given DPI.
+// contract boxes are relative to the CropBox and before /Rotate
+// (PAGE_SPACE_CROP_BOX), and the rendered page is the CropBox turned
+// clockwise by /Rotate with a top-left origin. Returns {left, top, right,
+// bottom} in pixels at the given DPI.
 std::array<double, 4> ToDisplayPixels(const pdfv1::PageInfo& info,
                                       const pdfv1::BoundingBox& box,
                                       double dpi) {
   const int rotation = ((info.rotation_degrees() % 360) + 360) % 360;
-  const double origin_x = info.crop_box().x0();
-  const double origin_y = info.crop_box().y0();
+  const bool crop_relative =
+      info.page_space() == pdfv1::PAGE_SPACE_CROP_BOX;
+  const double origin_x = crop_relative ? 0.0 : info.crop_box().x0();
+  const double origin_y = crop_relative ? 0.0 : info.crop_box().y0();
   const double width = info.crop_box().x1() - info.crop_box().x0();
   const double height = info.crop_box().y1() - info.crop_box().y0();
   auto to_display = [&](double x, double y) -> std::array<double, 2> {
@@ -1157,8 +1169,9 @@ int main(int argc, char** argv) {
   }
 
   // frames.pdf: the same content on eight differently framed pages. Every
-  // family comes out in unrotated user space, PageInfo carries the true
-  // (inherited) /Rotate and the stored boxes, and the raster is the CropBox
+  // family comes out unrotated and relative to the CropBox, PageInfo says
+  // so in page_space and carries the true (inherited) /Rotate and the
+  // stored boxes, and the raster is the CropBox
   // turned by /Rotate, so the client's page mapping lands each box on its
   // ink.
   const std::string frames = ReadFile(fixture_dir + "/frames.pdf");
@@ -1169,7 +1182,8 @@ int main(int argc, char** argv) {
     double height;
     std::array<double, 4> media;
     std::array<double, 4> crop;
-    // Where "Frame" starts, its baseline, and the red rectangle.
+    // Where "Frame" starts, its baseline, and the red rectangle, in user
+    // space as the content stream draws them.
     double text_x;
     double baseline;
     std::array<double, 4> red;
@@ -1205,6 +1219,11 @@ int main(int argc, char** argv) {
             page + "media_box as stored, unrotated");
       Check(BoxNear(info.crop_box(), want.crop, 0.01),
             page + "crop_box as stored, unrotated");
+      Check(info.page_space() == pdfv1::PAGE_SPACE_CROP_BOX,
+            page + "page_space names the CropBox frame");
+      // Where the content stream draws, moved by the CropBox origin.
+      const double text_x = want.text_x - want.crop[0];
+      const double baseline = want.baseline - want.crop[1];
 
       const auto it = parsed.pages.find(static_cast<uint32_t>(i));
       if (it == parsed.pages.end()) {
@@ -1214,13 +1233,13 @@ int main(int argc, char** argv) {
       const pdfv1::TextCell* cell = FindCell(it->second, "Frame");
       Check(cell != nullptr, page + "\"Frame\" cell present");
       if (cell != nullptr) {
-        Check(Near(cell->bbox().x0(), want.text_x, 1.5),
+        Check(Near(cell->bbox().x0(), text_x, 1.5),
               page + "cell starts where the text is drawn");
-        Check(cell->bbox().y0() <= want.baseline + 0.5 &&
-                  cell->bbox().y0() >= want.baseline - 8,
+        Check(cell->bbox().y0() <= baseline + 0.5 &&
+                  cell->bbox().y0() >= baseline - 8,
               page + "cell bottom at the baseline");
-        Check(cell->bbox().y1() >= want.baseline + 12 &&
-                  cell->bbox().y1() <= want.baseline + 25,
+        Check(cell->bbox().y1() >= baseline + 12 &&
+                  cell->bbox().y1() <= baseline + 25,
               page + "cell top an em above the baseline");
         Check(Near(cell->quad().x0(), cell->bbox().x0(), 1.5) &&
                   Near(cell->quad().y0(), cell->bbox().y0(), 1.5),
@@ -1228,26 +1247,32 @@ int main(int argc, char** argv) {
       }
       bool red_found = false;
       for (const auto& shape : it->second.shapes()) {
-        if (BoxNear(shape.bbox(), want.red, 0.5)) red_found = true;
+        if (BoxNear(shape.bbox(), CropRelative(info, want.red), 0.5)) {
+          red_found = true;
+        }
       }
       Check(red_found, page + "red rectangle where it is drawn");
     }
-    // Pages 1 to 5 draw exactly what page 0 draws: rotating or cropping the
-    // page must not move a cell.
+    // Pages 1 to 5 draw exactly what page 0 draws: rotating the page must
+    // not move a cell, and cropping it moves the cell by exactly the
+    // CropBox origin.
     const pdfv1::TextCell* upright =
         parsed.pages.count(0) ? FindCell(parsed.pages[0], "Frame") : nullptr;
     for (uint32_t i = 1; i <= 5 && upright != nullptr; ++i) {
       const pdfv1::TextCell* cell =
           parsed.pages.count(i) ? FindCell(parsed.pages[i], "Frame") : nullptr;
+      const pdfv1::BoundingBox& u = upright->bbox();
       Check(cell != nullptr &&
                 BoxNear(cell->bbox(),
-                        {upright->bbox().x0(), upright->bbox().y0(),
-                         upright->bbox().x1(), upright->bbox().y1()},
+                        CropRelative(parsed.header.pages(static_cast<int>(i)),
+                                     {u.x0(), u.y0(), u.x1(), u.y1()}),
                         0.01),
             "frames page " + std::to_string(i) +
-                ": the cell sits exactly where the upright page has it");
+                ": the cell sits where the upright page has it, less the "
+                "CropBox origin");
     }
-    // Links and widgets share the cells' frame, CropBox or not.
+    // Links and widgets share the cells' frame, CropBox or not. The rects
+    // below are as stored, in user space.
     struct FramedLink {
       uint32_t page;
       std::string uri;
@@ -1263,8 +1288,9 @@ int main(int argc, char** argv) {
       if (chunk.hyperlinks_size() != 1) continue;
       const auto& link = chunk.hyperlinks(0);
       Check(link.uri() == want.uri, page + "link target");
-      Check(BoxNear(link.bbox(), want.rect, 0.01),
-            page + "link rect as stored, corners normalized");
+      const auto& info = parsed.header.pages(static_cast<int>(want.page));
+      Check(BoxNear(link.bbox(), CropRelative(info, want.rect), 0.01),
+            page + "link rect relative to the CropBox, corners normalized");
       const pdfv1::TextCell* cell = FindCell(chunk, "Frame");
       if (cell != nullptr) {
         const double cx = (cell->bbox().x0() + cell->bbox().x1()) / 2;
@@ -1286,17 +1312,26 @@ int main(int argc, char** argv) {
       const std::string page = "frames page " + std::to_string(want.page) + ": ";
       Check(chunk.form_fields_size() == 1 &&
                 chunk.form_fields(0).name() == want.name &&
-                BoxNear(chunk.form_fields(0).rect(), want.rect, 0.01),
-            page + "widget rect as stored");
+                BoxNear(chunk.form_fields(0).rect(),
+                        CropRelative(parsed.header.pages(
+                                         static_cast<int>(want.page)),
+                                     want.rect),
+                        0.01),
+            page + "widget rect relative to the CropBox");
     }
     const pdfv1::TextCell* edge =
         parsed.pages.count(5) ? FindCell(parsed.pages[5], "Edge") : nullptr;
-    Check(edge != nullptr && Near(edge->bbox().x0(), 20, 1.5),
-          "frames page 5: a cell straddling the CropBox edge is kept");
+    // "Edge" is drawn at x 20, left of the CropBox at x 36.
+    Check(edge != nullptr && Near(edge->bbox().x0(), 20 - 36, 1.5),
+          "frames page 5: a cell straddling the CropBox edge is kept, at a "
+          "negative x");
+    // Drawn at (120, 200, 170, 230) on a page whose CropBox starts at
+    // (50, 60).
     Check(parsed.pages[7].images_size() == 1 &&
-              BoxNear(parsed.pages[7].images(0).bbox(), {120, 200, 170, 230},
+              BoxNear(parsed.pages[7].images(0).bbox(), {70, 140, 120, 170},
                       0.5),
-          "frames page 7: image placed where its matrix puts it");
+          "frames page 7: image placed where its matrix puts it, relative "
+          "to the CropBox");
   }
   // Render agrees with Parse: the client maps each page's red rectangle and
   // "Frame" cell through PageInfo onto the raster, the red ink is there and
@@ -1319,11 +1354,12 @@ int main(int argc, char** argv) {
                 raster.height_px() ==
                     static_cast<uint32_t>(std::ceil(info.height_pts())),
             page + "raster is the displayed page");
+      const std::array<double, 4> red_box = CropRelative(info, framed[i].red);
       pdfv1::BoundingBox box;
-      box.set_x0(framed[i].red[0]);
-      box.set_y0(framed[i].red[1]);
-      box.set_x1(framed[i].red[2]);
-      box.set_y1(framed[i].red[3]);
+      box.set_x0(red_box[0]);
+      box.set_y0(red_box[1]);
+      box.set_x1(red_box[2]);
+      box.set_y1(red_box[3]);
       const auto px = ToDisplayPixels(info, box, 72.0);
       const auto [inside, outside] = CountPixels(
           raster, {px[0] - 2, px[1] - 2, px[2] + 2, px[3] + 2}, IsRed);
