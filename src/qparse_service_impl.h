@@ -7,11 +7,12 @@
 #include <grpcpp/grpcpp.h>
 
 #include "ai/protomolt/parse/pdf/v1/pdf_backend_service.grpc.pb.h"
+#include "call_slots.h"
 #include "document_cache.h"
 
 namespace grpc_qparse {
 
-// The most bytes one Flate or RunLength stream may decode to, by default:
+// The most bytes one Flate, RunLength or LZW stream may decode to, by default:
 // 512 MiB, the samples of a 2^27-pixel image (the largest Render draws) at
 // four bytes a pixel. qpdf decodes a stream whole before anyone sees its
 // size, so this is what bounds a compressed stream that inflates to far
@@ -49,17 +50,21 @@ RenderLimits RenderLimitsFromEnv();
 // PdfBackendService over the MIT qpdf-based cell parser. The engine is
 // safe to use concurrently through independent per-request decoder
 // instances, so the service is plain thread-per-request with no worker
-// pool. The content-addressed byte cache behind PdfDocument.sha256 lives
-// here in the one server process, shared across requests.
+// pool; CallSlots bounds how many Parse and Render calls run at once. The
+// content-addressed byte cache behind PdfDocument.sha256 lives here in the
+// one server process, shared across requests.
 class QparseServiceImpl final
     : public ai::protomolt::parse::pdf::v1::PdfBackendService::Service {
  public:
-  // Cache and Render bounds from the GRPC_QPARSE_* environment.
+  // Cache, Render and call bounds from the GRPC_QPARSE_* environment.
   QparseServiceImpl()
       : QparseServiceImpl(DocumentCacheConfigFromEnv(), RenderLimitsFromEnv()) {}
   explicit QparseServiceImpl(DocumentCacheConfig cache_config,
-                             RenderLimits render_limits = RenderLimitsFromEnv())
-      : cache_(cache_config), render_limits_(render_limits) {}
+                             RenderLimits render_limits = RenderLimitsFromEnv(),
+                             CallLimits call_limits = CallLimitsFromEnv())
+      : cache_(cache_config),
+        render_limits_(render_limits),
+        slots_(call_limits) {}
   grpc::Status Probe(
       grpc::ServerContext* context,
       const ai::protomolt::parse::pdf::v1::ProbeRequest* request,
@@ -90,6 +95,7 @@ class QparseServiceImpl final
  private:
   DocumentCache cache_;
   const RenderLimits render_limits_;
+  CallSlots slots_;
   std::atomic<uint64_t> decoded_pages_{0};
 };
 

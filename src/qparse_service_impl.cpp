@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -19,6 +20,7 @@
 #include <qpdf/QPDFExc.hh>
 #include <qpdf/QPDFObjectHandle.hh>
 #include <qpdf/QPDFPageObjectHelper.hh>
+#include <qpdf/Pl_DCT.hh>
 #include <qpdf/Pl_Flate.hh>
 #include <qpdf/Pl_RunLength.hh>
 
@@ -26,6 +28,7 @@
 #include <parse.h>
 #include <render.h>
 
+#include "lzw_filter.h"
 #include "sha256.h"
 
 namespace grpc_qparse {
@@ -264,21 +267,25 @@ std::set<FontKey> EmbeddedFontsOf(QPDFObjectHandle resources) {
   return embedded;
 }
 
-// The pixels an image XObject declares, when /Width and /Height are
-// positive integers; each side is capped at 2^32 so the product cannot
-// overflow, and any side that large is over every budget anyway.
+// The pixels an image XObject declares, when it has a numeric /Width and
+// /Height. The engine takes any number there and truncates it, so a real
+// counts as its whole part; a side that is not finite, or under one pixel,
+// counts as over every budget. Each side is capped at 2^32 so the product
+// cannot overflow, and any side that large is over every budget anyway.
 std::optional<uint64_t> ImagePixels(QPDFObjectHandle image) {
   if (!image.isStream()) return std::nullopt;
   QPDFObjectHandle dict = image.getDict();
   QPDFObjectHandle width = dict.getKey("/Width");
   QPDFObjectHandle height = dict.getKey("/Height");
-  if (!width.isInteger() || !height.isInteger()) return std::nullopt;
-  const long long w = width.getIntValue();
-  const long long h = height.getIntValue();
-  if (w <= 0 || h <= 0) return std::nullopt;
-  constexpr uint64_t kSideCap = uint64_t{1} << 32;
-  return std::min<uint64_t>(static_cast<uint64_t>(w), kSideCap) *
-         std::min<uint64_t>(static_cast<uint64_t>(h), kSideCap);
+  if (!width.isNumber() || !height.isNumber()) return std::nullopt;
+  const double w = std::trunc(width.getNumericValue());
+  const double h = std::trunc(height.getNumericValue());
+  if (!(w >= 1.0) || !(h >= 1.0) || !std::isfinite(w) || !std::isfinite(h)) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  constexpr double kSideCap = 4294967296.0;  // 2^32
+  return static_cast<uint64_t>(std::min(w, kSideCap)) *
+         static_cast<uint64_t>(std::min(h, kSideCap));
 }
 
 bool IsImage(QPDFObjectHandle xobject) {
@@ -1266,10 +1273,18 @@ uint64_t DecodedStreamLimitFromEnv() {
 void InitEngine(const std::string& resources_dir,
                 uint64_t decoded_stream_limit) {
   loguru::g_stderr_verbosity = loguru::Verbosity_ERROR;
-  // qpdf throws once a Flate or RunLength decoder has written this much,
-  // and the engine treats that stream as undecodable.
+  // qpdf throws once a Flate, RunLength or LZW decoder has written this
+  // much, and the engine treats that stream as undecodable. qpdf's own LZW
+  // decoder has no limit, so ours replaces it. jpeglib is held to the same
+  // bytes. qpdf's other decoders (ASCIIHex, ASCII85, Crypt) give at most
+  // four bytes per input byte, and the engine's own image codecs are
+  // bounded by the pixels an image declares (DropOversizedImages).
   Pl_Flate::memory_limit(decoded_stream_limit);
   Pl_RunLength::setMemoryLimit(decoded_stream_limit);
+  InstallLimitedLzwDecode(decoded_stream_limit);
+  Pl_DCT::setMemoryLimit(static_cast<long>(std::min<uint64_t>(
+      decoded_stream_limit,
+      static_cast<uint64_t>(std::numeric_limits<long>::max()))));
   resource_utils::set_resources_dir(resources_dir);
   // The font resource registries (glyphs, encodings, cmaps, base fonts)
   // load once per process; without this, decoding throws on the first
@@ -1305,6 +1320,10 @@ grpc::Status QparseServiceImpl::Parse(
     if (grpc::Status range = CheckPageRange(request->pages()); !range.ok()) {
       return range;
     }
+  }
+  CallSlots::Slot slot;
+  if (grpc::Status admitted = slots_.Acquire(context, &slot); !admitted.ok()) {
+    return admitted;
   }
   LoadedDocument loaded;
   switch (ResolveDocumentBytes(request->document(), &cache_, &loaded)) {
@@ -1510,6 +1529,10 @@ grpc::Status QparseServiceImpl::Render(
     if (grpc::Status range = CheckPageRange(request->pages()); !range.ok()) {
       return range;
     }
+  }
+  CallSlots::Slot slot;
+  if (grpc::Status admitted = slots_.Acquire(context, &slot); !admitted.ok()) {
+    return admitted;
   }
   LoadedDocument loaded;
   switch (ResolveDocumentBytes(request->document(), &cache_, &loaded)) {

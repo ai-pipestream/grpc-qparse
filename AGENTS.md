@@ -46,6 +46,14 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   self-contained `src/sha256.cpp` on purpose: gRPC links its vendored
   BoringSSL statically, and adding a second crypto library risks duplicate
   symbol definitions.
+- Memory bounds: `src/call_slots.{h,cpp}` caps concurrent Parse and Render
+  calls (`GRPC_QPARSE_MAX_CONCURRENT_CALLS`, default max(2, cores / 2);
+  `GRPC_QPARSE_QUEUE_TIMEOUT_S`, default 300, then RESOURCE_EXHAUSTED).
+  `GRPC_QPARSE_MAX_DECODED_STREAM_BYTES` bounds every qpdf decoder that can
+  inflate: Flate and RunLength through qpdf's own limits, DCT through
+  jpeglib's, and LZW through the replacement filter in
+  `src/lzw_filter.{h,cpp}` (qpdf's has no limit). `test/fixtures/bomb.pdf`
+  and `lzw.pdf` pin these.
 - Default port is 50070 (`GRPC_QPARSE_PORT` overrides), the fleet-registered
   assignment in the workspace table; the backend fleet used to collide with
   gRParse/grPOIc/grpc-libreoffice on 50051-50053.

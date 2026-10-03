@@ -227,7 +227,9 @@ endif()
 add_executable(grpc_qparse
   src/main.cpp
   src/qparse_service_impl.cpp
+  src/call_slots.cpp
   src/document_cache.cpp
+  src/lzw_filter.cpp
   src/sha256.cpp)
 target_include_directories(grpc_qparse PRIVATE src)
 target_include_directories(grpc_qparse SYSTEM PRIVATE "${TOPLEVEL_PREFIX_PATH}/src")
@@ -243,7 +245,9 @@ enable_testing()
 add_executable(qparse_contract_test
   test/contract_roundtrip_test.cpp
   src/qparse_service_impl.cpp
+  src/call_slots.cpp
   src/document_cache.cpp
+  src/lzw_filter.cpp
   src/sha256.cpp)
 target_include_directories(qparse_contract_test PRIVATE src)
 target_include_directories(qparse_contract_test SYSTEM PRIVATE "${TOPLEVEL_PREFIX_PATH}/src")

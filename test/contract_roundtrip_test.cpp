@@ -2,10 +2,11 @@
 // process, dial it through the generated stubs, and walk the tier 0
 // families plus this backend's own strengths (reading-order cells, shapes,
 // embedded fonts) over the hello.pdf, rich.pdf, fonts.pdf, frames.pdf,
-// encrypted.pdf and bomb.pdf fixtures.
+// encrypted.pdf, bomb.pdf and lzw.pdf fixtures.
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +18,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -812,9 +814,12 @@ int main(int argc, char** argv) {
     // before its samples are decoded, whatever the page's own size: page 0
     // draws a 400 x 400 black image (160000 pixels, over the budget) and
     // page 1 a 200 x 200 one (within it), each over its whole 100 pt page.
-    auto image_page = [](int side) {
-      return "<< /Type /XObject /Subtype /Image /Width " +
-             std::to_string(side) + " /Height " + std::to_string(side) +
+    // Page 2's image declares its 400 x 400 as reals, which the engine
+    // takes as well, so it counts the same.
+    auto image_page = [](int side, const std::string& suffix = "") {
+      const std::string size = std::to_string(side) + suffix;
+      return "<< /Type /XObject /Subtype /Image /Width " + size +
+             " /Height " + size +
              " /ColorSpace /DeviceGray /BitsPerComponent 8 /Length " +
              std::to_string(side * side) + " >>\nstream\n" +
              std::string(static_cast<size_t>(side * side), '\0') +
@@ -822,19 +827,22 @@ int main(int argc, char** argv) {
     };
     const std::string images = AssemblePdf(
         {"<< /Type /Catalog /Pages 2 0 R >>",
-         "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 "
+         "<< /Type /Pages /Kids [3 0 R 4 0 R 8 0 R] /Count 3 "
          "/MediaBox [0 0 100 100] >>",
          "<< /Type /Page /Parent 2 0 R /Contents 5 0 R "
          "/Resources << /XObject << /Im0 6 0 R >> >> >>",
          "<< /Type /Page /Parent 2 0 R /Contents 5 0 R "
          "/Resources << /XObject << /Im0 7 0 R >> >> >>",
          Stream("q 100 0 0 100 0 0 cm /Im0 Do Q"), image_page(400),
-         image_page(200)});
+         image_page(200),
+         "<< /Type /Page /Parent 2 0 R /Contents 5 0 R "
+         "/Resources << /XObject << /Im0 9 0 R >> >> >>",
+         image_page(400, ".0")});
     rasters = RenderDocument(small_stub.get(), images, 36.0,
                              pdfv1::PIXEL_FORMAT_GRAY8, std::nullopt, &status);
-    Check(status.ok() && rasters.size() == 2,
+    Check(status.ok() && rasters.size() == 3,
           "a page with an image over the budget still renders");
-    if (rasters.size() == 2) {
+    if (rasters.size() == 3) {
       auto center = [](const pdfv1::PageRaster& raster) {
         return static_cast<unsigned char>(
             raster.pixels()[(raster.height_px() / 2) * raster.stride_bytes() +
@@ -843,6 +851,8 @@ int main(int argc, char** argv) {
       Check(center(rasters[0]) > 200,
             "the image over the budget is left out, the page stays white");
       Check(center(rasters[1]) < 50, "the image within the budget is drawn");
+      Check(center(rasters[2]) > 200,
+            "an image over the budget in real numbers is left out too");
     }
     small_server->Shutdown();
     Check(grpc_qparse::RenderLimits{}.max_pixels ==
@@ -887,6 +897,41 @@ int main(int argc, char** argv) {
               parsed.pages[1].images_size() == 1 &&
               parsed.pages[1].images(0).source_width_px() == 64,
           "Parse still places both bomb.pdf images");
+  }
+
+  // lzw.pdf: page 0's content stream and page 1's image samples are LZW
+  // bombs, a few kilobytes of codes that decode to 260 MiB of zeros under
+  // a Flate layer that inflates to far less than the limit. The decoded
+  // stream limit stops the LZW stage: Parse returns, and Render leaves the
+  // image out, so page 1's square stays white. Pages 2 and 3 are honest
+  // LZW text, the second with /EarlyChange 0 and a PNG predictor, and
+  // still decode.
+  {
+    const std::string lzw = ReadFile(fixture_dir + "/lzw.pdf");
+    Check(!lzw.empty() && lzw.size() < 65536, "lzw.pdf read, and small");
+    ParseResult parsed = ParseDocument(
+        stub.get(), lzw, {pdfv1::PDF_FAMILY_TEXT_CELLS}, std::nullopt);
+    Check(parsed.status.ok() && parsed.pages.size() == 4,
+          "Parse of lzw.pdf returns every page");
+    Check(parsed.pages[0].text_cells_size() == 0,
+          "the LZW bomb content stream yields no cells");
+    for (uint32_t page : {2u, 3u}) {
+      Check(FindCell(parsed.pages[page], "LZW text") != nullptr,
+            "lzw.pdf page " + std::to_string(page) + " decodes its LZW text");
+    }
+    grpc::Status status;
+    std::vector<pdfv1::PageRaster> rasters = RenderDocument(
+        stub.get(), lzw, 36.0, pdfv1::PIXEL_FORMAT_GRAY8,
+        std::make_pair(1u, 2u), &status);
+    Check(status.ok() && rasters.size() == 1,
+          "lzw.pdf renders the page with the LZW bomb image");
+    if (rasters.size() == 1) {
+      // The square is 100..300 by 400..600 pt, (100, 146) px at 36 dpi.
+      const size_t center = 146 * size_t{rasters[0].stride_bytes()} + 100;
+      Check(rasters[0].pixels().size() > center &&
+                static_cast<unsigned char>(rasters[0].pixels()[center]) > 200,
+            "the LZW bomb image is not drawn");
+    }
   }
 
   // The decoded stream limit comes from the environment; unset, zero or
@@ -1622,6 +1667,85 @@ int main(int argc, char** argv) {
             render ? "a cancelled Render stops decoding"
                    : "a cancelled Parse stops decoding");
     }
+  }
+
+  // Concurrent Parse and Render calls are capped. With one slot, a Render
+  // that is still streaming holds it: a Parse waits, then fails
+  // RESOURCE_EXHAUSTED once the queue timeout passes, while Probe is not
+  // held back. A Parse already waiting gets the slot once the Render ends.
+  {
+    grpc_qparse::CallLimits call_limits;
+    call_limits.max_concurrent = 1;
+    call_limits.queue_timeout = std::chrono::seconds(1);
+    grpc_qparse::QparseServiceImpl capped_service(
+        grpc_qparse::DocumentCacheConfig{}, grpc_qparse::RenderLimits{},
+        call_limits);
+    int capped_port = 0;
+    std::unique_ptr<grpc::Server> capped_server =
+        StartServer(&capped_service, &capped_port);
+    auto capped_stub = Dial(capped_port);
+
+    grpc::ClientContext holder_ctx;
+    pdfv1::RenderRequest holder_request;
+    holder_request.mutable_document()->set_data(ManyPagePdf(400));
+    holder_request.set_dpi(36.0);
+    auto holder = capped_stub->Render(&holder_ctx, holder_request);
+    pdfv1::RenderResponse holder_msg;
+    Check(holder->Read(&holder_msg) && holder_msg.has_raster(),
+          "the Render holding the only slot streams");
+
+    const auto started = std::chrono::steady_clock::now();
+    ParseResult refused = ParseDocument(
+        capped_stub.get(), hello, {pdfv1::PDF_FAMILY_TEXT_CELLS}, std::nullopt);
+    Check(refused.status.error_code() == grpc::RESOURCE_EXHAUSTED,
+          "a Parse with no free slot fails RESOURCE_EXHAUSTED");
+    Check(std::chrono::steady_clock::now() - started >=
+              std::chrono::milliseconds(900),
+          "the refused Parse waited out the queue timeout first");
+    {
+      grpc::ClientContext ctx;
+      pdfv1::ProbeRequest request;
+      request.mutable_document()->set_data(hello);
+      pdfv1::ProbeResponse response;
+      Check(capped_stub->Probe(&ctx, request, &response).ok(),
+            "Probe is not held back by the cap");
+    }
+
+    ParseResult admitted;
+    std::thread waiter([&] {
+      admitted = ParseDocument(capped_stub.get(), hello,
+                               {pdfv1::PDF_FAMILY_TEXT_CELLS}, std::nullopt);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    holder_ctx.TryCancel();
+    while (holder->Read(&holder_msg)) {
+    }
+    holder->Finish();
+    waiter.join();
+    Check(admitted.status.ok() && admitted.pages.size() == 1,
+          "a waiting Parse runs once the slot frees");
+    capped_server->Shutdown();
+
+    setenv("GRPC_QPARSE_MAX_CONCURRENT_CALLS", "3", 1);
+    setenv("GRPC_QPARSE_QUEUE_TIMEOUT_S", "0", 1);
+    grpc_qparse::CallLimits from_env = grpc_qparse::CallLimitsFromEnv();
+    Check(from_env.max_concurrent == 3 && from_env.queue_timeout.count() == 0,
+          "GRPC_QPARSE_MAX_CONCURRENT_CALLS and GRPC_QPARSE_QUEUE_TIMEOUT_S "
+          "set the call bounds");
+    for (const char* bad : {"", "0", "lots", "-1"}) {
+      setenv("GRPC_QPARSE_MAX_CONCURRENT_CALLS", bad, 1);
+      Check(grpc_qparse::CallLimitsFromEnv().max_concurrent ==
+                grpc_qparse::DefaultMaxConcurrentCalls(),
+            std::string("GRPC_QPARSE_MAX_CONCURRENT_CALLS=\"") + bad +
+                "\" keeps the default");
+    }
+    setenv("GRPC_QPARSE_QUEUE_TIMEOUT_S", "604801", 1);
+    Check(grpc_qparse::CallLimitsFromEnv().queue_timeout.count() == 300,
+          "a queue timeout over a week keeps the default");
+    unsetenv("GRPC_QPARSE_MAX_CONCURRENT_CALLS");
+    unsetenv("GRPC_QPARSE_QUEUE_TIMEOUT_S");
+    Check(grpc_qparse::DefaultMaxConcurrentCalls() >= 2,
+          "the default cap is at least 2");
   }
 
   server->Shutdown();
