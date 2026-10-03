@@ -1129,6 +1129,51 @@ int main(int argc, char** argv) {
     }
   }
 
+  // A landscape page as producers write one: the text runs up the page in
+  // user space and /Rotate 90 turns it upright. The engine merges the line
+  // whole in user space, its quad runs up the page, and the client's
+  // mapping turns its box into a wide display box where the glyphs are.
+  {
+    const std::string landscape = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate 90 "
+         "/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+         Stream("BT /F1 18 Tf 0 1 -1 0 300 100 Tm (Landscape line of text) Tj "
+                "ET"),
+         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"});
+    ParseResult parsed = ParseDocument(
+        stub.get(), landscape, {pdfv1::PDF_FAMILY_TEXT_CELLS}, std::nullopt);
+    const pdfv1::TextCell* cell =
+        parsed.pages.count(0) ? FindCell(parsed.pages[0], "Landscape") : nullptr;
+    Check(parsed.status.ok() && cell != nullptr &&
+              cell->text().find("Landscape line of text") != std::string::npos,
+          "landscape text comes out as one whole line");
+    if (cell != nullptr && parsed.header.pages_size() == 1) {
+      Check(Near(cell->quad().x0(), cell->quad().x1(), 0.5) &&
+                cell->quad().y1() - cell->quad().y0() > 100,
+            "the landscape cell's quad runs up the page in user space");
+      const auto box =
+          ToDisplayPixels(parsed.header.pages(0), cell->bbox(), 72.0);
+      Check(box[2] - box[0] > 5 * (box[3] - box[1]),
+            "the client maps the landscape cell to a wide display box");
+      grpc::Status status;
+      std::vector<pdfv1::PageRaster> rasters = RenderDocument(
+          stub.get(), landscape, 72.0, pdfv1::PIXEL_FORMAT_RGBA8,
+          std::nullopt, &status);
+      Check(status.ok() && rasters.size() == 1 &&
+                rasters[0].width_px() == 792 && rasters[0].height_px() == 612,
+            "the landscape page renders turned");
+      if (rasters.size() == 1) {
+        const auto ink = CountPixels(
+            rasters[0], {box[0] - 2, box[1] - 2, box[2] + 2, box[3] + 2},
+            IsInk);
+        Check(ink.first >= 150 && ink.second == 0,
+              "the landscape glyphs are where the client maps the cell");
+      }
+    }
+  }
+
   // A page range decodes only its pages, and document-level families decode
   // none; the header still carries the whole inventory.
   {
