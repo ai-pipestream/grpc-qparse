@@ -1,8 +1,8 @@
 // Contract test for grpc-qparse: start the engine-backed service in
 // process, dial it through the generated stubs, and walk the tier 0
 // families plus this backend's own strengths (reading-order cells, shapes,
-// embedded fonts) over the hello.pdf, rich.pdf, fonts.pdf, frames.pdf and
-// encrypted.pdf fixtures.
+// embedded fonts) over the hello.pdf, rich.pdf, fonts.pdf, frames.pdf,
+// encrypted.pdf and bomb.pdf fixtures.
 
 #include <algorithm>
 #include <array>
@@ -295,7 +295,10 @@ int main(int argc, char** argv) {
   const std::string rich = ReadFile(fixture_dir + "/rich.pdf");
   Check(!hello.empty() && !rich.empty(), "fixtures read");
 
-  grpc_qparse::InitEngine(argv[2]);
+  // A 64 MiB decoded stream limit, well under the 512 MiB default, so the
+  // bomb.pdf check below needs no more than that to prove the limit holds.
+  constexpr uint64_t kTestDecodedStreamLimit = uint64_t{64} << 20;
+  grpc_qparse::InitEngine(argv[2], kTestDecodedStreamLimit);
 
   grpc_qparse::QparseServiceImpl service;
   grpc::ServerBuilder builder;
@@ -792,10 +795,105 @@ int main(int argc, char** argv) {
                              &status);
     Check(status.ok() && rasters.size() == 1,
           "the page within the budget renders on its own");
+
+    // An image with more pixels than the budget is left out of the page
+    // before its samples are decoded, whatever the page's own size: page 0
+    // draws a 400 x 400 black image (160000 pixels, over the budget) and
+    // page 1 a 200 x 200 one (within it), each over its whole 100 pt page.
+    auto image_page = [](int side) {
+      return "<< /Type /XObject /Subtype /Image /Width " +
+             std::to_string(side) + " /Height " + std::to_string(side) +
+             " /ColorSpace /DeviceGray /BitsPerComponent 8 /Length " +
+             std::to_string(side * side) + " >>\nstream\n" +
+             std::string(static_cast<size_t>(side * side), '\0') +
+             "\nendstream";
+    };
+    const std::string images = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 "
+         "/MediaBox [0 0 100 100] >>",
+         "<< /Type /Page /Parent 2 0 R /Contents 5 0 R "
+         "/Resources << /XObject << /Im0 6 0 R >> >> >>",
+         "<< /Type /Page /Parent 2 0 R /Contents 5 0 R "
+         "/Resources << /XObject << /Im0 7 0 R >> >> >>",
+         Stream("q 100 0 0 100 0 0 cm /Im0 Do Q"), image_page(400),
+         image_page(200)});
+    rasters = RenderDocument(small_stub.get(), images, 36.0,
+                             pdfv1::PIXEL_FORMAT_GRAY8, std::nullopt, &status);
+    Check(status.ok() && rasters.size() == 2,
+          "a page with an image over the budget still renders");
+    if (rasters.size() == 2) {
+      auto center = [](const pdfv1::PageRaster& raster) {
+        return static_cast<unsigned char>(
+            raster.pixels()[(raster.height_px() / 2) * raster.stride_bytes() +
+                            raster.width_px() / 2]);
+      };
+      Check(center(rasters[0]) > 200,
+            "the image over the budget is left out, the page stays white");
+      Check(center(rasters[1]) < 50, "the image within the budget is drawn");
+    }
     small_server->Shutdown();
     Check(grpc_qparse::RenderLimits{}.max_pixels ==
               grpc_qparse::kMaxRenderPixels,
           "the default budget is the most one message carries");
+  }
+
+  // bomb.pdf: two images deflated twice, a few kilobytes that inflate to
+  // hundreds of megabytes of black. Page 0's honestly declares 12000 x
+  // 12000, over the default pixel budget, and is left out before a sample
+  // is decoded; page 1's declares 64 x 64 but inflates to 256 MiB, and the
+  // decoded stream limit stops it. Both pages render, white where the
+  // images would be, and Parse, which never decodes samples, still lists
+  // both.
+  {
+    const std::string bomb = ReadFile(fixture_dir + "/bomb.pdf");
+    Check(!bomb.empty() && bomb.size() < 8192, "bomb.pdf read, and tiny");
+    ErrorLog errors;
+    loguru::add_callback("bomb", &ErrorLog::Collect, &errors,
+                         loguru::Verbosity_ERROR);
+    grpc::Status status;
+    std::vector<pdfv1::PageRaster> rasters = RenderDocument(
+        stub.get(), bomb, 36.0, pdfv1::PIXEL_FORMAT_GRAY8, std::nullopt,
+        &status);
+    loguru::remove_callback("bomb");
+    Check(status.ok() && rasters.size() == 2, "bomb.pdf renders both pages");
+    for (const auto& raster : rasters) {
+      // The square is 100..300 by 400..600 pt, (100, 146) px at 36 dpi.
+      const size_t center = 146 * size_t{raster.stride_bytes()} + 100;
+      Check(raster.pixels().size() > center &&
+                static_cast<unsigned char>(raster.pixels()[center]) > 200,
+            "bomb.pdf page " + std::to_string(raster.page_index()) +
+                ": the image is not drawn");
+    }
+    Check(errors.Contains("page 0: image /Im0 is left out"),
+          "the log names the image left out of page 0");
+    ParseResult parsed = ParseDocument(
+        stub.get(), bomb, {pdfv1::PDF_FAMILY_PLACED_IMAGES}, std::nullopt);
+    Check(parsed.status.ok() && parsed.pages.size() == 2 &&
+              parsed.pages[0].images_size() == 1 &&
+              parsed.pages[0].images(0).source_width_px() == 12000 &&
+              parsed.pages[1].images_size() == 1 &&
+              parsed.pages[1].images(0).source_width_px() == 64,
+          "Parse still places both bomb.pdf images");
+  }
+
+  // The decoded stream limit comes from the environment; unset, zero or
+  // unparseable keeps the default.
+  {
+    setenv("GRPC_QPARSE_MAX_DECODED_STREAM_BYTES", "1048576", 1);
+    Check(grpc_qparse::DecodedStreamLimitFromEnv() == 1048576,
+          "GRPC_QPARSE_MAX_DECODED_STREAM_BYTES sets the limit");
+    for (const char* bad : {"", "0", "lots", "12abc"}) {
+      setenv("GRPC_QPARSE_MAX_DECODED_STREAM_BYTES", bad, 1);
+      Check(grpc_qparse::DecodedStreamLimitFromEnv() ==
+                grpc_qparse::kMaxDecodedStreamBytes,
+            std::string("GRPC_QPARSE_MAX_DECODED_STREAM_BYTES=\"") + bad +
+                "\" keeps the default");
+    }
+    unsetenv("GRPC_QPARSE_MAX_DECODED_STREAM_BYTES");
+    Check(grpc_qparse::DecodedStreamLimitFromEnv() ==
+              grpc_qparse::kMaxDecodedStreamBytes,
+          "the decoded stream limit defaults to 512 MiB");
   }
 
   // Render produces the requested pixel layout: frames.pdf page 0 at 72 dpi

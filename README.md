@@ -154,4 +154,14 @@ reason at ERROR. The budget comes from the environment:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GRPC_QPARSE_RENDER_MAX_PIXELS` | 134217728 (2^27) | Pixels one page's raster may have; also the ceiling, since a 2^27-pixel RGBA raster is the most one 520 MiB message carries. |
+| `GRPC_QPARSE_RENDER_MAX_PIXELS` | 134217728 (2^27) | Pixels one page's raster may have; also the ceiling, since a 2^27-pixel RGBA raster is the most one 520 MiB message carries. Also the most pixels an image XObject (or its soft mask) may declare. |
+| `GRPC_QPARSE_MAX_DECODED_STREAM_BYTES` | 536870912 (512 MiB) | Bytes one Flate or RunLength stream may decode to, on every RPC; qpdf holds it process-wide. |
+
+Image samples are bounded before they are decoded. An image XObject a
+page reaches (through its forms, patterns and Type3 fonts too) that
+declares more pixels than the budget, or whose `/SMask` or `/Mask` does,
+is left out of the page before the engine decodes it, and the service
+logs which one at ERROR; the page renders without it. A stream that
+inflates past the decoded stream limit, whatever size it declares, is
+cut off there and treated as undecodable. `Parse` never decodes image
+samples, so it still reports every image's placement and size.

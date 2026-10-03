@@ -19,6 +19,8 @@
 #include <qpdf/QPDFExc.hh>
 #include <qpdf/QPDFObjectHandle.hh>
 #include <qpdf/QPDFPageObjectHelper.hh>
+#include <qpdf/Pl_Flate.hh>
+#include <qpdf/Pl_RunLength.hh>
 
 // The engine umbrella headers (header-only library over qpdf).
 #include <parse.h>
@@ -262,6 +264,59 @@ std::set<FontKey> EmbeddedFontsOf(QPDFObjectHandle resources) {
   return embedded;
 }
 
+// The pixels an image XObject declares, when /Width and /Height are
+// positive integers; each side is capped at 2^32 so the product cannot
+// overflow, and any side that large is over every budget anyway.
+std::optional<uint64_t> ImagePixels(QPDFObjectHandle image) {
+  if (!image.isStream()) return std::nullopt;
+  QPDFObjectHandle dict = image.getDict();
+  QPDFObjectHandle width = dict.getKey("/Width");
+  QPDFObjectHandle height = dict.getKey("/Height");
+  if (!width.isInteger() || !height.isInteger()) return std::nullopt;
+  const long long w = width.getIntValue();
+  const long long h = height.getIntValue();
+  if (w <= 0 || h <= 0) return std::nullopt;
+  constexpr uint64_t kSideCap = uint64_t{1} << 32;
+  return std::min<uint64_t>(static_cast<uint64_t>(w), kSideCap) *
+         std::min<uint64_t>(static_cast<uint64_t>(h), kSideCap);
+}
+
+bool IsImage(QPDFObjectHandle xobject) {
+  return xobject.isStream() &&
+         xobject.getDict().getKey("/Subtype").isNameAndEquals("/Image");
+}
+
+// Takes every image XObject with more than max_pixels pixels, or whose
+// /SMask or stencil /Mask has, out of the resource dictionaries a page
+// reaches, before the engine decodes a sample: the engine defilters a
+// page's every image whole, so a few kilobytes of deflated zeros declaring
+// 12000 x 12000 would otherwise cost the full sample buffer and the
+// rasterizer's copy of it. The page renders without the image. The edit
+// touches only this call's qpdf objects. Returns the dropped resource
+// names.
+std::vector<std::string> DropOversizedImages(QPDFObjectHandle resources,
+                                             uint64_t max_pixels) {
+  std::vector<std::string> dropped;
+  for (QPDFObjectHandle reachable : ReachableResources(resources)) {
+    QPDFObjectHandle xobjects = reachable.getKey("/XObject");
+    if (!xobjects.isDictionary()) continue;
+    for (const std::string& key : xobjects.getKeys()) {
+      QPDFObjectHandle image = xobjects.getKey(key);
+      if (!IsImage(image)) continue;
+      bool oversized = false;
+      for (QPDFObjectHandle part : {image, image.getDict().getKey("/SMask"),
+                                    image.getDict().getKey("/Mask")}) {
+        const std::optional<uint64_t> pixels = ImagePixels(part);
+        if (pixels.has_value() && *pixels > max_pixels) oversized = true;
+      }
+      if (!oversized) continue;
+      xobjects.removeKey(key);
+      dropped.push_back(key);
+    }
+  }
+  return dropped;
+}
+
 // The document's pages for Parse and Render, on a qpdf handle of the
 // call's own beside the engine's document decoder. The inventory comes
 // from the page dictionaries without decoding any content; a page's
@@ -323,8 +378,12 @@ class DocumentPages {
   // /Rotate 0, so every item stays in unrotated user space, the contract's
   // frame; Render passes the rotation to the rasterizer instead. The edits
   // touch only this call's qpdf objects, never the bytes.
+  //
+  // When the call decodes image samples, max_image_pixels bounds every image
+  // the page reaches (DropOversizedImages); each image left out is logged.
   std::shared_ptr<pdflib::pdf_decoder<pdflib::PAGE>> Decode(
-      int index, const pdflib::decode_config& config) {
+      int index, const pdflib::decode_config& config,
+      std::optional<uint64_t> max_image_pixels = std::nullopt) {
     QPDFObjectHandle page = pages_.at(static_cast<size_t>(index));
     const PageGeometry& page_geometry = geometry(index);
     page.replaceKey("/MediaBox", BoxArray(page_geometry.media_box));
@@ -339,6 +398,15 @@ class DocumentPages {
         QPDFObjectHandle inherited =
             QPDFPageObjectHelper(page).getAttribute("/Resources", false);
         if (inherited.isDictionary()) page.replaceKey("/Resources", inherited);
+      }
+    }
+    if (config.extract_bitmap_pixels && max_image_pixels.has_value()) {
+      for (const std::string& name : DropOversizedImages(
+               QPDFPageObjectHelper(page).getAttribute("/Resources", false),
+               *max_image_pixels)) {
+        LOG_S(ERROR) << "page " << index << ": image " << name
+                     << " is left out, it has more than " << *max_image_pixels
+                     << " pixels";
       }
     }
     auto decoder =
@@ -1175,8 +1243,24 @@ RenderLimits RenderLimitsFromEnv() {
   return limits;
 }
 
-void InitEngine(const std::string& resources_dir) {
+uint64_t DecodedStreamLimitFromEnv() {
+  const char* value = std::getenv("GRPC_QPARSE_MAX_DECODED_STREAM_BYTES");
+  if (value == nullptr || *value == '\0') return kMaxDecodedStreamBytes;
+  char* end = nullptr;
+  const uint64_t parsed = std::strtoull(value, &end, 10);
+  if (end == value || *end != '\0' || parsed == 0) {
+    return kMaxDecodedStreamBytes;
+  }
+  return parsed;
+}
+
+void InitEngine(const std::string& resources_dir,
+                uint64_t decoded_stream_limit) {
   loguru::g_stderr_verbosity = loguru::Verbosity_ERROR;
+  // qpdf throws once a Flate or RunLength decoder has written this much,
+  // and the engine treats that stream as undecodable.
+  Pl_Flate::memory_limit(decoded_stream_limit);
+  Pl_RunLength::setMemoryLimit(decoded_stream_limit);
   resource_utils::set_resources_dir(resources_dir);
   // The font resource registries (glyphs, encodings, cmaps, base fonts)
   // load once per process; without this, decoding throws on the first
@@ -1472,7 +1556,7 @@ grpc::Status QparseServiceImpl::Render(
     std::shared_ptr<pdflib::pdf_decoder<pdflib::PAGE>> decoder;
     try {
       ++decoded_pages_;
-      decoder = loaded.pages->Decode(i, config);
+      decoder = loaded.pages->Decode(i, config, render_limits_.max_pixels);
     } catch (const std::exception& e) {
       LOG_S(ERROR) << "Render skips page " << i
                    << ": the engine could not decode it: " << e.what();
