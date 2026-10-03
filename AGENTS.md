@@ -57,7 +57,10 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   toolchain) compiles and runs ctest as the image gate; the runtime is the
   hardened `dhi.io/debian-base:trixie-debian13` base (glibc only, no
   package manager, no ldconfig, uid 65532) carrying the binary, the engine
-  font resources under `/usr/local/share/grpc-qparse/pdf_resources`, and
+  font resources under `/usr/local/share/grpc-qparse/pdf_resources` (with
+  the pinned Liberation fallback faces in `fonts/fallback`, which the
+  rasterizer needs for every non-embedded font because the base has no
+  system fonts; the render test checks for real glyph ink), and
   the staged shared-library closure (`scripts/stage-runtime-libs.sh`)
   under `/usr/local/lib` on `LD_LIBRARY_PATH`. The build stage must stay on
   a glibc no newer than the runtime base's (2.41); a build on ubuntu 26.04

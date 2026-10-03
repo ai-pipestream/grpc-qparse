@@ -253,6 +253,11 @@ bool IsRed(const unsigned char* p) {
   return p[0] > 200 && p[1] < 60 && p[2] < 60;
 }
 
+// Near-black: glyph ink, not the renderer's light blue outline fallback.
+bool IsInk(const unsigned char* p) {
+  return p[0] < 100 && p[1] < 100 && p[2] < 100;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -438,7 +443,7 @@ int main(int argc, char** argv) {
     auto reader = stub->Render(&ctx, request);
     pdfv1::RenderResponse msg;
     Check(reader->Read(&msg), "render produced a raster");
-    const auto& raster = msg.raster();
+    const pdfv1::PageRaster raster = msg.raster();
     Check(raster.width_px() >= 611 && raster.width_px() <= 613,
           "raster width near Letter at 72 DPI");
     Check(raster.height_px() >= 791 && raster.height_px() <= 793,
@@ -448,16 +453,29 @@ int main(int argc, char** argv) {
     Check(raster.pixels().size() ==
               static_cast<size_t>(raster.stride_bytes()) * raster.height_px(),
           "raster payload matches stride * height");
-    bool has_ink = false;
-    for (size_t i = 0; i + 3 < raster.pixels().size(); i += 4) {
-      if (static_cast<unsigned char>(raster.pixels()[i]) != 0xFF) {
-        has_ink = true;
-        break;
-      }
-    }
-    Check(has_ink, "raster has non-white pixels");
     Check(!reader->Read(&msg), "one raster for the one page");
     Check(reader->Finish().ok(), "render finished OK");
+
+    // Helvetica is not embedded, so the glyphs come from the bundled
+    // fallback faces. Real glyphs leave dark ink inside the cell's box and
+    // only there; a missing face draws a faint blue outline instead, and a
+    // filled box would cover the whole cell.
+    ParseResult parsed = ParseDocument(
+        stub.get(), hello, {pdfv1::PDF_FAMILY_TEXT_CELLS}, std::nullopt);
+    const pdfv1::TextCell* cell =
+        parsed.pages.count(0) ? FindCell(parsed.pages[0], "Hello") : nullptr;
+    Check(cell != nullptr && parsed.header.pages_size() == 1,
+          "hello.pdf cell for the glyph check");
+    if (cell != nullptr && parsed.header.pages_size() == 1) {
+      const auto box =
+          ToDisplayPixels(parsed.header.pages(0), cell->bbox(), 72.0);
+      const auto [inside, outside] = CountPixels(
+          raster, {box[0] - 2, box[1] - 2, box[2] + 2, box[3] + 2}, IsInk);
+      const double area = (box[2] - box[0]) * (box[3] - box[1]);
+      Check(inside >= 150, "raster draws the glyphs of the text cell");
+      Check(inside < 0.7 * area, "the glyphs are glyphs, not a filled box");
+      Check(outside == 0, "no ink outside the text cell");
+    }
   }
 
   // Render load failures are typed in a one-message head stream, never a
@@ -825,12 +843,12 @@ int main(int argc, char** argv) {
                       0.5),
           "frames page 7: image placed where its matrix puts it");
   }
-  // Render agrees with Parse: the client maps each page's red rectangle
-  // through PageInfo onto the raster, and the red ink is there and nowhere
-  // else.
+  // Render agrees with Parse: the client maps each page's red rectangle and
+  // "Frame" cell through PageInfo onto the raster, the red ink is there and
+  // nowhere else, and the glyphs are where the cell is.
   {
     ParseResult parsed = ParseDocument(
-        stub.get(), frames, {pdfv1::PDF_FAMILY_PAGE_INVENTORY}, std::nullopt);
+        stub.get(), frames, {pdfv1::PDF_FAMILY_TEXT_CELLS}, std::nullopt);
     grpc::Status status;
     std::vector<pdfv1::PageRaster> rasters = RenderDocument(
         stub.get(), frames, 72.0, pdfv1::PIXEL_FORMAT_RGBA8, std::nullopt,
@@ -858,6 +876,20 @@ int main(int argc, char** argv) {
       Check(inside >= 0.8 * area,
             page + "red rectangle drawn where the client maps it");
       Check(outside == 0, page + "no red ink anywhere else");
+      const auto chunk = parsed.pages.find(i);
+      const pdfv1::TextCell* text = chunk != parsed.pages.end()
+                                        ? FindCell(chunk->second, "Frame")
+                                        : nullptr;
+      Check(text != nullptr, page + "\"Frame\" cell for the glyph check");
+      if (text != nullptr) {
+        const auto glyphs = ToDisplayPixels(info, text->bbox(), 72.0);
+        const auto ink = CountPixels(
+            raster,
+            {glyphs[0] - 2, glyphs[1] - 2, glyphs[2] + 2, glyphs[3] + 2},
+            IsInk);
+        Check(ink.first >= 100,
+              page + "glyphs drawn where the client maps the cell");
+      }
     }
   }
 

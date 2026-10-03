@@ -25,7 +25,7 @@ the resources, so every page inherits them.
 from pathlib import Path
 
 FRAME_TEXT = b"BT /F1 24 Tf 72 700 Td (Frame) Tj ET\n"
-RED_BOX = b"1 0 0 rg 300 500 60 30 re f\n"
+RED_BOX = b"q 1 0 0 rg 300 500 60 30 re f Q\n"
 
 
 def stream(dict_body: bytes, data: bytes) -> bytes:
@@ -110,12 +110,12 @@ objects = {
     CONTENT6: stream(
         b"",
         b"BT /F1 24 Tf 172 900 Td (Frame) Tj ET\n"
-        b"1 0 0 rg 400 700 60 30 re f\n",
+        b"q 1 0 0 rg 400 700 60 30 re f Q\n",
     ),
     CONTENT7: stream(
         b"",
         b"BT /F1 24 Tf 72 650 Td (Frame) Tj ET\n"
-        b"1 0 0 rg 300 400 60 30 re f\n"
+        b"q 1 0 0 rg 300 400 60 30 re f Q\n"
         b"q 50 0 0 30 120 200 cm /Im0 Do Q\n",
     ),
     # The link rectangles are stored top corner first on purpose: a /Rect

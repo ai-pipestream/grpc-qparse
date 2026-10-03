@@ -44,9 +44,14 @@ GRPC_QPARSE_PORT=50070 GRPC_QPARSE_RESOURCES=./build/pdf_resources ./build/grpc_
 workspace `AGENTS.md`); `GRPC_QPARSE_PORT` overrides it.
 
 `GRPC_QPARSE_RESOURCES` points at the engine's font resource directory
-(staged into the build tree at configure time). Health and server
-reflection are enabled; `Probe`, `Parse`, `Render`, and `GetServiceInfo`
-are the service surface.
+(staged into the build tree at configure time). It also holds the
+rasterizer's fallback faces under `fonts/fallback`: Liberation Sans, Serif
+and Mono 2.1.5 (SIL OFL 1.1, license beside them), downloaded at configure
+time from the pinned release and sha256-verified. Text in a font the PDF
+does not embed, the standard 14 included, is drawn with them; without
+them it would rasterize as outline boxes, since the runtime image has no
+system fonts. Health and server reflection are enabled; `Probe`, `Parse`,
+`Render`, and `GetServiceInfo` are the service surface.
 
 ## Docker
 

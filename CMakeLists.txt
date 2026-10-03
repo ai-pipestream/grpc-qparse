@@ -157,6 +157,46 @@ set(QPARSE_RESOURCES_DIR "${CMAKE_CURRENT_BINARY_DIR}/pdf_resources")
 file(COPY "${TOPLEVEL_PREFIX_PATH}/docling_parse/pdf_resources/"
   DESTINATION "${QPARSE_RESOURCES_DIR}")
 
+# Fallback faces for the rasterizer. The engine draws a font that is not
+# embedded (the standard 14 among them) with a face it finds by name under
+# <resources>/fonts/fallback or the system font directories, and the
+# runtime image has no system fonts, so without these every such glyph came
+# out as a bare outline box. Liberation Sans, Serif and Mono are
+# metric-compatible with Helvetica, Times and Courier; SIL OFL 1.1, whose
+# LICENSE ships beside the faces. Pinned by version and sha256, and the
+# archive is re-verified on every configure.
+set(QPARSE_FALLBACK_FONTS_VERSION "2.1.5")
+set(QPARSE_FALLBACK_FONTS_URL
+    "https://github.com/liberationfonts/liberation-fonts/files/7261482/liberation-fonts-ttf-${QPARSE_FALLBACK_FONTS_VERSION}.tar.gz")
+set(QPARSE_FALLBACK_FONTS_SHA256
+    "7191c669bf38899f73a2094ed00f7b800553364f90e2637010a69c0e268f25d0")
+set(QPARSE_FONTS_EXPORT "${CMAKE_CURRENT_BINARY_DIR}/fonts-export")
+set(QPARSE_FALLBACK_FONTS_ARCHIVE
+    "${QPARSE_FONTS_EXPORT}/liberation-fonts-ttf-${QPARSE_FALLBACK_FONTS_VERSION}.tar.gz")
+if(EXISTS "${QPARSE_FALLBACK_FONTS_ARCHIVE}")
+  file(SHA256 "${QPARSE_FALLBACK_FONTS_ARCHIVE}" FONTS_ARCHIVE_SHA256)
+  if(NOT FONTS_ARCHIVE_SHA256 STREQUAL QPARSE_FALLBACK_FONTS_SHA256)
+    file(REMOVE "${QPARSE_FALLBACK_FONTS_ARCHIVE}")
+  endif()
+endif()
+if(NOT EXISTS "${QPARSE_FALLBACK_FONTS_ARCHIVE}")
+  file(DOWNLOAD "${QPARSE_FALLBACK_FONTS_URL}" "${QPARSE_FALLBACK_FONTS_ARCHIVE}"
+    EXPECTED_HASH SHA256=${QPARSE_FALLBACK_FONTS_SHA256}
+    STATUS FONTS_DL_STATUS)
+  list(GET FONTS_DL_STATUS 0 FONTS_DL_CODE)
+  if(NOT FONTS_DL_CODE EQUAL 0)
+    file(REMOVE "${QPARSE_FALLBACK_FONTS_ARCHIVE}")
+    message(FATAL_ERROR "fallback font download failed: ${FONTS_DL_STATUS}")
+  endif()
+endif()
+file(ARCHIVE_EXTRACT INPUT "${QPARSE_FALLBACK_FONTS_ARCHIVE}"
+  DESTINATION "${QPARSE_FONTS_EXPORT}")
+set(QPARSE_FALLBACK_FONTS_DIR
+    "${QPARSE_FONTS_EXPORT}/liberation-fonts-ttf-${QPARSE_FALLBACK_FONTS_VERSION}")
+file(COPY "${QPARSE_FALLBACK_FONTS_DIR}/"
+  DESTINATION "${QPARSE_RESOURCES_DIR}/fonts/fallback"
+  FILES_MATCHING PATTERN "*.ttf" PATTERN "LICENSE" PATTERN "AUTHORS")
+
 # ---------------------------------------------------------------------------
 # The service binary.
 # ---------------------------------------------------------------------------
