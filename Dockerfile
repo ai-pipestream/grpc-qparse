@@ -8,10 +8,11 @@
 # the image. The runtime stage is a hardened, glibc-only base: no package
 # manager, no ldconfig run, and no shell needed. It carries the binary, the
 # engine's font resources (which the service must find through
-# GRPC_QPARSE_RESOURCES or decode throws), and the shared libraries the
-# binary needs beyond glibc (libstdc++, libgcc_s, libz), staged from the
-# build stage into /usr/local/lib by scripts/stage-runtime-libs.sh, which
-# fails the build if anything would still resolve from outside it.
+# GRPC_QPARSE_RESOURCES or decode throws), the shared libraries the binary
+# needs beyond glibc (libstdc++, libgcc_s, libz), staged from the build
+# stage into /usr/local/lib by scripts/stage-runtime-libs.sh, which fails
+# the build if anything would still resolve from outside it, and the
+# third-party license texts under /usr/local/share/doc/grpc-qparse.
 #
 # The build stage is Debian trixie on purpose: the runtime base's glibc is
 # 2.41, and a binary linked against a newer glibc (ubuntu 26.04's) refuses
@@ -61,7 +62,8 @@ RUN --mount=type=cache,id=grpc-qparse-trixie-grpc1.83.1-make-${TARGETARCH}${GRPC
     && ctest --test-dir /build --output-on-failure \
     && mkdir -p /out/lib && cp /build/grpc_qparse /out/ \
     && cp -r /build/pdf_resources /out/pdf_resources \
-    && scripts/stage-runtime-libs.sh /out/lib /out/grpc_qparse
+    && scripts/stage-runtime-libs.sh /out/lib /out/grpc_qparse \
+    && scripts/collect-notices.sh /build /src /out/doc
 
 # LD_LIBRARY_PATH stands in for ldconfig, and the numeric USER works with or
 # without a passwd entry (65532 is the conventional nonroot uid in hardened
@@ -71,6 +73,9 @@ FROM ${GRPC_QPARSE_RUNTIME_IMAGE}
 COPY --from=build /out/lib/ /usr/local/lib/
 COPY --from=build /out/grpc_qparse /usr/local/bin/grpc_qparse
 COPY --from=build /out/pdf_resources /usr/local/share/grpc-qparse/pdf_resources
+# LICENSE, NOTICE and every redistributed component's license text
+# (scripts/collect-notices.sh).
+COPY --from=build /out/doc/ /usr/local/share/doc/grpc-qparse/
 
 ENV GRPC_QPARSE_PORT=50070 \
     GRPC_QPARSE_RESOURCES=/usr/local/share/grpc-qparse/pdf_resources \

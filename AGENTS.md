@@ -62,7 +62,11 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   rasterizer needs for every non-embedded font because the base has no
   system fonts; the render test checks for real glyph ink), and
   the staged shared-library closure (`scripts/stage-runtime-libs.sh`)
-  under `/usr/local/lib` on `LD_LIBRARY_PATH`. The build stage must stay on
+  under `/usr/local/lib` on `LD_LIBRARY_PATH`, plus `LICENSE`, `NOTICE`
+  and each redistributed component's license text under
+  `/usr/local/share/doc/grpc-qparse` (`scripts/collect-notices.sh`, which
+  fails the build when a listed file is missing; a new dependency needs a
+  line there and in `NOTICE`). The build stage must stay on
   a glibc no newer than the runtime base's (2.41); a build on ubuntu 26.04
   produces a binary the base cannot load. `GRPC_QPARSE_RUNTIME_IMAGE`
   swaps the base. Published as a linux/amd64 + linux/arm64 manifest list,

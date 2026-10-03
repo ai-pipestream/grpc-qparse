@@ -5,6 +5,9 @@ implementing the fleet's common `PdfBackendService` contract
 (`ai.protomolt.parse.pdf.v1`, from the parser-protos commit this
 build pins). The wrapper is Apache-2.0; the engine and its dependency set
 (qpdf, blend2d, freetype, openjpeg, lcms2, libjpeg) are all permissive.
+`NOTICE` lists every component the image redistributes with its license,
+and the image carries their license texts under
+`/usr/local/share/doc/grpc-qparse`.
 
 What this backend is for: reading-order text cells (its sanitizers merge
 raw chars into model-ready cells with direction, space width and rendering
@@ -89,10 +92,13 @@ container runs read-only without a tmpfs.
 run before any push: the library closure resolves inside the image (the
 dynamic loader reports it, since the base has no `ldd`), the server
 reaches its "listening on" line under `--read-only --cap-drop ALL` (which
-also proves the engine found its font resources), and every process runs
-as uid 65532. Published as a linux/amd64 + linux/arm64 manifest list, each
-leg built and smoke-tested natively on its own architecture (the arm64 leg
-runs on GitHub's hosted arm64 runner). The publish workflow pushes
+also proves the engine found its font resources), every process runs as
+uid 65532, and the license texts are in the image
+(`scripts/collect-notices.sh` gathers them in the build stage and fails
+the build if one has moved). Published as a linux/amd64 + linux/arm64
+manifest list, each leg built and smoke-tested natively on its own
+architecture (the arm64 leg runs on GitHub's hosted arm64 runner). The
+publish workflow pushes
 `docker.io/pipestreamai/grpc-qparse:latest` on every push to main.
 
 ## Content-addressed documents
