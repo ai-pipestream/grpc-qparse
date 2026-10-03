@@ -14,6 +14,23 @@ namespace grpc_qparse {
 // One-time process setup: engine logging and the font resource directory.
 void InitEngine(const std::string& resources_dir);
 
+// The largest raster Render produces, by default and at most: 2^27 pixels,
+// a 512 MiB RGBA canvas, the most that still fits one message under the
+// fleet's 520 MiB limit.
+inline constexpr uint64_t kMaxRenderPixels = uint64_t{1} << 27;
+
+// Bounds on Render. A page whose raster at the requested DPI would exceed
+// max_pixels, or 65535 pixels on a side (the rasterizer's own limit),
+// fails the call with RESOURCE_EXHAUSTED before any page is rendered.
+struct RenderLimits {
+  // GRPC_QPARSE_RENDER_MAX_PIXELS, at most kMaxRenderPixels.
+  uint64_t max_pixels = kMaxRenderPixels;
+};
+
+// Reads the Render bounds from the environment; an unset, unparseable or
+// zero value keeps the default, a larger one is capped.
+RenderLimits RenderLimitsFromEnv();
+
 // PdfBackendService over the MIT qpdf-based cell parser. The engine is
 // safe to use concurrently through independent per-request decoder
 // instances, so the service is plain thread-per-request with no worker
@@ -22,10 +39,12 @@ void InitEngine(const std::string& resources_dir);
 class QparseServiceImpl final
     : public ai::protomolt::parse::pdf::v1::PdfBackendService::Service {
  public:
-  // Cache bounds from the GRPC_QPARSE_CACHE_* environment.
-  QparseServiceImpl() : QparseServiceImpl(DocumentCacheConfigFromEnv()) {}
-  explicit QparseServiceImpl(DocumentCacheConfig cache_config)
-      : cache_(cache_config) {}
+  // Cache and Render bounds from the GRPC_QPARSE_* environment.
+  QparseServiceImpl()
+      : QparseServiceImpl(DocumentCacheConfigFromEnv(), RenderLimitsFromEnv()) {}
+  explicit QparseServiceImpl(DocumentCacheConfig cache_config,
+                             RenderLimits render_limits = RenderLimitsFromEnv())
+      : cache_(cache_config), render_limits_(render_limits) {}
   grpc::Status Probe(
       grpc::ServerContext* context,
       const ai::protomolt::parse::pdf::v1::ProbeRequest* request,
@@ -55,6 +74,7 @@ class QparseServiceImpl final
 
  private:
   DocumentCache cache_;
+  const RenderLimits render_limits_;
   std::atomic<uint64_t> decoded_pages_{0};
 };
 

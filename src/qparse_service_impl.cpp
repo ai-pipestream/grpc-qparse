@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <optional>
@@ -751,6 +754,36 @@ pdflib::size_instruction SizeInstruction(const PageGeometry& geometry) {
   return size;
 }
 
+// Blend2D refuses an image wider or taller than this.
+constexpr double kMaxRasterSide = 65535.0;
+
+// The rasterizer keeps each worker thread's last canvas for its next page
+// (blend2d_renderer.h, canvas_pool). A canvas over this many pixels is
+// released after use, so one large page does not stay resident on a gRPC
+// thread for the life of the process.
+constexpr double kPooledCanvasPixels = 4096.0 * 4096.0;
+
+// The raster the rasterizer allocates for a page at a scale: the displayed
+// page rounded up to whole pixels as render/config.h pixels_for_extent
+// rounds, at least one pixel a side.
+std::array<double, 2> RasterSize(const PageGeometry& geometry, float scale) {
+  return {std::max(1.0, std::ceil(geometry.DisplayWidth() * scale - 1e-6)),
+          std::max(1.0, std::ceil(geometry.DisplayHeight() * scale - 1e-6))};
+}
+
+// Leaves a one-pixel canvas in this thread's pool in place of the last
+// one: a renderer hands its canvas to the pool when it is destroyed.
+void ReleasePooledCanvas() {
+  pdflib::render_config config;
+  config.scale = 1.0f;
+  config.glyph_bbox_cache_capacity = 0;
+  pdflib::renderer<pdflib::BLEND2D> release(config);
+  pdflib::size_instruction size;
+  size.media_bbox = {0.0, 0.0, 1.0, 1.0};
+  size.crop_bbox = size.media_bbox;
+  release.set_size(size);
+}
+
 // The page-level families, the ones that need a page decoded.
 bool WantPageItems(const pdfv1::ParseRequest& request) {
   for (pdfv1::PdfFamily family :
@@ -771,6 +804,17 @@ void AddPageWarning(pdfv1::ParseTrailer* trailer, int page_index,
 }
 
 }  // namespace
+
+RenderLimits RenderLimitsFromEnv() {
+  RenderLimits limits;
+  const char* value = std::getenv("GRPC_QPARSE_RENDER_MAX_PIXELS");
+  if (value == nullptr || *value == '\0') return limits;
+  char* end = nullptr;
+  const uint64_t parsed = std::strtoull(value, &end, 10);
+  if (end == value || *end != '\0' || parsed == 0) return limits;
+  limits.max_pixels = std::min(parsed, kMaxRenderPixels);
+  return limits;
+}
 
 void InitEngine(const std::string& resources_dir) {
   loguru::g_stderr_verbosity = loguru::Verbosity_ERROR;
@@ -978,9 +1022,13 @@ grpc::Status QparseServiceImpl::Parse(
 grpc::Status QparseServiceImpl::Render(
     grpc::ServerContext* context, const pdfv1::RenderRequest* request,
     grpc::ServerWriter<pdfv1::RenderResponse>* writer) {
-  if (request->dpi() <= 0.0) {
+  // NaN fails every comparison, so it is rejected by name; the scale the
+  // rasterizer takes is a float, which a tiny DPI rounds to zero.
+  const double dpi = request->dpi();
+  const float scale = static_cast<float>(dpi / 72.0);
+  if (!std::isfinite(dpi) || dpi <= 0.0 || !(scale > 0.0f)) {
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                        "dpi must be positive");
+                        "dpi must be a positive finite number");
   }
   LoadedDocument loaded;
   switch (ResolveDocumentBytes(request->document(), &cache_, &loaded)) {
@@ -1012,7 +1060,24 @@ grpc::Status QparseServiceImpl::Render(
     end = std::min<int>(static_cast<int>(request->pages().end()), page_count);
   }
 
-  const float scale = static_cast<float>(request->dpi() / 72.0);
+  // Every page is sized before any is rendered, so a page over the budget
+  // fails the call before a raster streams or a canvas is allocated.
+  for (int i = begin; i < end; ++i) {
+    const std::array<double, 2> size =
+        RasterSize(loaded.pages->geometry(i), scale);
+    if (size[0] > kMaxRasterSide || size[1] > kMaxRasterSide ||
+        size[0] * size[1] > static_cast<double>(render_limits_.max_pixels)) {
+      char detail[256];
+      std::snprintf(detail, sizeof(detail),
+                    "page %d at %g dpi needs a %.0fx%.0f pixel raster; the "
+                    "limit is %llu pixels and %.0f per side",
+                    i, dpi, size[0], size[1],
+                    static_cast<unsigned long long>(render_limits_.max_pixels),
+                    kMaxRasterSide);
+      return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, detail);
+    }
+  }
+
   const pdflib::decode_config config = RenderDecodeConfig(scale);
   pdflib::render_config render_cfg;
   render_cfg.scale = scale;
@@ -1032,20 +1097,34 @@ grpc::Status QparseServiceImpl::Render(
     }
     pdflib::size_instruction size = SizeInstruction(loaded.pages->geometry(i));
     decoder->get_instructions().add_size_instruction(size);
-    pdflib::renderer<pdflib::BLEND2D> rnd(render_cfg);
-    decoder->get_instructions().iterate_over_instructions(rnd);
-    auto canvas = rnd.get_canvas();
-    const auto& shape = rnd.get_shape();
-    if (canvas == nullptr || canvas->empty()) continue;
     pdfv1::RenderResponse msg;
-    auto* raster = msg.mutable_raster();
-    raster->set_page_index(static_cast<uint32_t>(i));
-    raster->set_height_px(static_cast<uint32_t>(shape[0]));
-    raster->set_width_px(static_cast<uint32_t>(shape[1]));
-    raster->set_stride_bytes(static_cast<uint32_t>(shape[1] * 4));
-    raster->set_pixel_format(pdfv1::PIXEL_FORMAT_RGBA8);
-    raster->set_dpi(request->dpi());
-    raster->set_pixels(canvas->data(), canvas->size());
+    bool rendered = false;
+    // A page the rasterizer throws on is skipped, the way a page the engine
+    // cannot decode is; the rest of the range still renders.
+    try {
+      pdflib::renderer<pdflib::BLEND2D> rnd(render_cfg);
+      decoder->get_instructions().iterate_over_instructions(rnd);
+      auto canvas = rnd.get_canvas();
+      const auto& shape = rnd.get_shape();
+      if (canvas != nullptr && !canvas->empty()) {
+        auto* raster = msg.mutable_raster();
+        raster->set_page_index(static_cast<uint32_t>(i));
+        raster->set_height_px(static_cast<uint32_t>(shape[0]));
+        raster->set_width_px(static_cast<uint32_t>(shape[1]));
+        raster->set_stride_bytes(static_cast<uint32_t>(shape[1] * 4));
+        raster->set_pixel_format(pdfv1::PIXEL_FORMAT_RGBA8);
+        raster->set_dpi(dpi);
+        raster->set_pixels(canvas->data(), canvas->size());
+        rendered = true;
+      }
+    } catch (const std::exception&) {
+    }
+    const std::array<double, 2> raster_size =
+        RasterSize(loaded.pages->geometry(i), scale);
+    if (raster_size[0] * raster_size[1] > kPooledCanvasPixels) {
+      ReleasePooledCanvas();
+    }
+    if (!rendered) continue;
     if (!writer->Write(msg)) return grpc::Status::OK;
   }
   return grpc::Status::OK;

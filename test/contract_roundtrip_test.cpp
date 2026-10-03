@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -493,6 +494,79 @@ int main(int argc, char** argv) {
           "head carries LOAD_STATUS_NOT_PDF");
     Check(!reader->Read(&msg), "head stream ends after one message");
     Check(reader->Finish().ok(), "unloadable render still finishes OK");
+  }
+
+  // Render takes only a positive finite DPI, and refuses a raster over the
+  // pixel budget (or 65535 pixels on a side) before rendering anything.
+  {
+    for (double bad : {std::nan(""), std::numeric_limits<double>::infinity(),
+                       -std::numeric_limits<double>::infinity(), 0.0, -72.0,
+                       1e-300}) {
+      grpc::Status status;
+      std::vector<pdfv1::PageRaster> rasters = RenderDocument(
+          stub.get(), hello, bad, pdfv1::PIXEL_FORMAT_RGBA8, std::nullopt,
+          &status);
+      Check(status.error_code() == grpc::INVALID_ARGUMENT && rasters.empty(),
+            "dpi " + std::to_string(bad) + " is INVALID_ARGUMENT");
+    }
+    grpc::Status status;
+    std::vector<pdfv1::PageRaster> rasters = RenderDocument(
+        stub.get(), hello, 1e6, pdfv1::PIXEL_FORMAT_RGBA8, std::nullopt,
+        &status);
+    Check(status.error_code() == grpc::RESOURCE_EXHAUSTED && rasters.empty(),
+          "a raster wider than the rasterizer allows is RESOURCE_EXHAUSTED");
+
+    // 14400 pt square, the largest page the spec allows: 207 megapixels at
+    // 72 dpi, over the 2^27 default; at 4 dpi it is about 800 x 800 (the
+    // rasterizer's float scale can round it up a pixel).
+    const std::string huge = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 14400 14400] "
+         "/Contents 4 0 R >>",
+         Stream("0 0 1 rg 0 0 7200 7200 re f")});
+    rasters = RenderDocument(stub.get(), huge, 72.0, pdfv1::PIXEL_FORMAT_RGBA8,
+                             std::nullopt, &status);
+    Check(status.error_code() == grpc::RESOURCE_EXHAUSTED && rasters.empty(),
+          "a raster over the default pixel budget is RESOURCE_EXHAUSTED");
+    rasters = RenderDocument(stub.get(), huge, 4.0, pdfv1::PIXEL_FORMAT_RGBA8,
+                             std::nullopt, &status);
+    Check(status.ok() && rasters.size() == 1 &&
+              rasters[0].width_px() >= 800 && rasters[0].width_px() <= 801 &&
+              rasters[0].height_px() == rasters[0].width_px(),
+          "the same page renders at a DPI within the budget");
+
+    // A configured budget applies to every page of the range before the
+    // first one renders: page 0 fits, page 1 does not, nothing streams and
+    // nothing is decoded.
+    grpc_qparse::RenderLimits limits;
+    limits.max_pixels = 100000;
+    grpc_qparse::QparseServiceImpl small_service(
+        grpc_qparse::DocumentCacheConfig{}, limits);
+    int small_port = 0;
+    std::unique_ptr<grpc::Server> small_server =
+        StartServer(&small_service, &small_port);
+    auto small_stub = Dial(small_port);
+    const std::string mixed = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"});
+    rasters = RenderDocument(small_stub.get(), mixed, 36.0,
+                             pdfv1::PIXEL_FORMAT_RGBA8, std::nullopt, &status);
+    Check(status.error_code() == grpc::RESOURCE_EXHAUSTED && rasters.empty(),
+          "one page over a configured budget fails the whole call up front");
+    Check(small_service.decoded_pages() == 0,
+          "a refused Render decodes nothing");
+    rasters = RenderDocument(small_stub.get(), mixed, 36.0,
+                             pdfv1::PIXEL_FORMAT_RGBA8, std::make_pair(0u, 1u),
+                             &status);
+    Check(status.ok() && rasters.size() == 1,
+          "the page within the budget renders on its own");
+    small_server->Shutdown();
+    Check(grpc_qparse::RenderLimits{}.max_pixels ==
+              grpc_qparse::kMaxRenderPixels,
+          "the default budget is the most one message carries");
   }
 
   // Content-addressed handshake (PdfDocument.sha256).

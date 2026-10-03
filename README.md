@@ -108,3 +108,17 @@ Cache bounds come from the environment:
 
 Eviction is least-recently-used. Cache lifetime is the process lifetime;
 the contract promises only the verdicts, never retention.
+
+## Render bounds
+
+`Render` takes a positive finite `dpi`; anything else (zero, negative,
+NaN, infinity) is `INVALID_ARGUMENT`. Before it renders a page it sizes
+every page in the range, and a page whose raster would be wider or taller
+than 65535 pixels (the rasterizer's limit) or larger than the pixel budget
+fails the whole call with `RESOURCE_EXHAUSTED`, before any raster streams.
+A page the engine or the rasterizer fails on is skipped and the rest of
+the range still renders. The budget comes from the environment:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GRPC_QPARSE_RENDER_MAX_PIXELS` | 134217728 (2^27) | Pixels one page's raster may have; also the ceiling, since a 2^27-pixel RGBA raster is the most one 520 MiB message carries. |
