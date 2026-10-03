@@ -48,6 +48,11 @@ ARG GRPC_QPARSE_BUILD_VERSION
 # A second builder sharing this cache mount (a developer build beside a CI
 # run, or an interrupted build that left a truncated object behind) gets its
 # own tree through --build-arg GRPC_QPARSE_BUILD_CACHE_SCOPE=-<name>.
+# TARGETARCH is a global-scope platform argument: without this declaration
+# it expands to nothing inside the stage, and both architectures would share
+# one cache tree. The engine, contract and font pins are plain CMake
+# variables, so a reused tree always configures the pinned commits.
+ARG TARGETARCH
 ARG GRPC_QPARSE_BUILD_CACHE_SCOPE=
 RUN --mount=type=cache,id=grpc-qparse-trixie-grpc1.83.1-make-${TARGETARCH}${GRPC_QPARSE_BUILD_CACHE_SCOPE},target=/build \
     cmake -S . -B /build -DCMAKE_BUILD_TYPE=Release \

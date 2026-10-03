@@ -33,18 +33,19 @@ FetchContent_MakeAvailable(grpc)
 # The download comes from the GitHub mirror's raw URL, not git.rokkon.com:
 # GitHub-hosted runners cannot resolve the Forgejo host, and the per-file
 # sha256 pins below verify the bytes either way.
+# The pins here and the engine and font pins below are plain variables, not
+# cache entries: a cache entry keeps the value of the first configure, so a
+# build tree reused across a pin bump (the Dockerfile's build cache mount, a
+# developer's build directory) would quietly keep building the old commit.
+# Bump them here.
 # ---------------------------------------------------------------------------
-set(PDF_PROTOS_COMMIT "ba226130c49683a8e629a6d3dc0f58c83c51c628"
-    CACHE STRING "parser-protos commit the contract comes from")
+set(PDF_PROTOS_COMMIT "ba226130c49683a8e629a6d3dc0f58c83c51c628")
 set(PDF_PROTOS_BASE_URL
-    "https://raw.githubusercontent.com/ai-pipestream/parser-protos/${PDF_PROTOS_COMMIT}/proto/ai/protomolt/parse/pdf/v1"
-    CACHE STRING "base URL the contract proto files are downloaded from")
+    "https://raw.githubusercontent.com/ai-pipestream/parser-protos/${PDF_PROTOS_COMMIT}/proto/ai/protomolt/parse/pdf/v1")
 set(PDF_PROTO_TYPES_SHA256
-    "27c9d9e4f822650344e609a1ca4ca79e7d7f2d867c0517f72bfa6982af8e8edd"
-    CACHE STRING "sha256 of pdf_backend_types.proto")
+    "27c9d9e4f822650344e609a1ca4ca79e7d7f2d867c0517f72bfa6982af8e8edd")
 set(PDF_PROTO_SERVICE_SHA256
-    "f0d47132b48af9cf09007afac32b26ef8f8e521b16f7bc105780d6afef5e4e8a"
-    CACHE STRING "sha256 of pdf_backend_service.proto")
+    "f0d47132b48af9cf09007afac32b26ef8f8e521b16f7bc105780d6afef5e4e8a")
 set(PDF_PROTO_LOCAL_DIR "" CACHE PATH "directory holding the contract protos, instead of the pinned download")
 
 set(STAGED_PROTO_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto")
@@ -117,7 +118,8 @@ target_link_libraries(pdf_backend_proto PUBLIC grpc++ grpc++_reflection libproto
 # a header library under src/. Only the library surface is used here; the
 # upstream app and python-binding targets are never configured.
 # ---------------------------------------------------------------------------
-set(QPARSE_ENGINE_TAG "824063d392142ffa5d0097dfc13faf963a9be113" CACHE STRING "engine commit")
+# The engine commit; a plain variable like the contract pins above.
+set(QPARSE_ENGINE_TAG "824063d392142ffa5d0097dfc13faf963a9be113")
 FetchContent_Declare(qparse_engine
   GIT_REPOSITORY https://github.com/docling-project/docling-parse.git
   GIT_TAG ${QPARSE_ENGINE_TAG})
