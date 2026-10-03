@@ -138,6 +138,7 @@ int main(int argc, char** argv) {
     int images = 0;
     int links = 0;
     int fields = 0;
+    std::vector<pdfv1::FormField> form_fields;
     int outline_roots = 0;
     bool cell_has_quad = false;
     bool cell_has_space_width = false;
@@ -154,6 +155,7 @@ int main(int argc, char** argv) {
         images += msg.page().images_size();
         links += msg.page().hyperlinks_size();
         fields += msg.page().form_fields_size();
+        for (const auto& f : msg.page().form_fields()) form_fields.push_back(f);
       } else if (msg.has_embedded_font()) {
         embedded.push_back(msg.embedded_font());
       } else if (msg.has_outline()) {
@@ -172,7 +174,37 @@ int main(int argc, char** argv) {
     Check(shapes >= 1, "vector shape extracted");
     Check(images == 1, "placed image extracted");
     Check(links >= 1, "hyperlink extracted");
-    Check(fields == 1, "form field extracted");
+    Check(fields == 2, "both form field widgets extracted");
+    const pdfv1::FormField* text_field = nullptr;
+    const pdfv1::FormField* check_box = nullptr;
+    for (const auto& f : form_fields) {
+      if (f.name() == "customer_name") text_field = &f;
+      if (f.name() == "agree") check_box = &f;
+    }
+    Check(text_field != nullptr && check_box != nullptr,
+          "text field and check box named");
+    if (text_field != nullptr) {
+      Check(text_field->kind() == pdfv1::FORM_FIELD_KIND_TEXT, "text kind");
+      Check(text_field->value() == "Jordan Example", "text value");
+      Check(text_field->alternate_name() == "Customer name", "text tooltip");
+      Check(text_field->has_flags() && text_field->flags() == 0 &&
+                !text_field->read_only(),
+            "text field flags are empty");
+      Check(!text_field->has_appearance_state(), "text widget has no /AS");
+    }
+    if (check_box != nullptr) {
+      // /FT and /Ff (ReadOnly) come from the parent field, /AS from the
+      // widget.
+      Check(check_box->kind() == pdfv1::FORM_FIELD_KIND_CHECK_BOX,
+            "check box kind from the inherited /FT and /Ff");
+      Check(check_box->has_flags() && check_box->flags() == 1,
+            "/Ff inherited from the parent");
+      Check(check_box->read_only(), "read-only follows the inherited /Ff");
+      Check(check_box->appearance_state() == "/Yes",
+            "/AS keeps the leading slash");
+      Check(check_box->alternate_name() == "I agree", "check box tooltip");
+      Check(check_box->value() == "Yes", "button value is the bare state name");
+    }
     Check(outline_roots == 2, "outline items extracted");
     Check(!embedded.empty() && embedded[0].program().size() > 100000,
           "embedded font program extracted");

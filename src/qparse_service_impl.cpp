@@ -428,25 +428,63 @@ void FillHyperlinks(const nlohmann::json& links, pdfv1::PageChunk* chunk) {
   }
 }
 
+// ISO 32000-1 field flag bits (table 221, 226, 228); bit n of the spec is
+// 1 << (n - 1).
+constexpr uint32_t kFieldFlagReadOnly = 1u << 0;
+constexpr uint32_t kFieldFlagRadio = 1u << 15;
+constexpr uint32_t kFieldFlagPushButton = 1u << 16;
+constexpr uint32_t kFieldFlagCombo = 1u << 17;
+
+// The typed kind from the inherited /FT and /Ff: /Btn and /Ch each cover
+// several kinds that only the flags tell apart.
+pdfv1::FormFieldKind FieldKind(const std::string& type, uint32_t flags) {
+  if (type == "/Tx") return pdfv1::FORM_FIELD_KIND_TEXT;
+  if (type == "/Sig") return pdfv1::FORM_FIELD_KIND_SIGNATURE;
+  if (type == "/Btn") {
+    if (flags & kFieldFlagPushButton) return pdfv1::FORM_FIELD_KIND_PUSH_BUTTON;
+    if (flags & kFieldFlagRadio) return pdfv1::FORM_FIELD_KIND_RADIO_BUTTON;
+    return pdfv1::FORM_FIELD_KIND_CHECK_BOX;
+  }
+  if (type == "/Ch") {
+    return (flags & kFieldFlagCombo) ? pdfv1::FORM_FIELD_KIND_COMBO_BOX
+                                     : pdfv1::FORM_FIELD_KIND_LIST_BOX;
+  }
+  return pdfv1::FORM_FIELD_KIND_UNSPECIFIED;
+}
+
+// One FormField per widget the engine reports. The engine resolves the
+// field type, /Ff and /TU through the /Parent chain (qpdf's form field
+// helper) and reads /AS from the widget itself, the same raw state
+// docling-core exposes as PdfWidget.widget_field_flags and
+// widget_appearance_state.
 void FillFormFields(const nlohmann::json& widgets, pdfv1::PageChunk* chunk) {
   if (!widgets.is_array()) return;
   for (const auto& w : widgets) {
     auto* field = chunk->add_form_fields();
-    std::string type = w.value("field_type", "");
-    if (type == "/Tx") {
-      field->set_kind(pdfv1::FORM_FIELD_KIND_TEXT);
-    } else if (type == "/Btn") {
-      field->set_kind(pdfv1::FORM_FIELD_KIND_PUSH_BUTTON);
-    } else if (type == "/Ch") {
-      field->set_kind(pdfv1::FORM_FIELD_KIND_COMBO_BOX);
-    } else if (type == "/Sig") {
-      field->set_kind(pdfv1::FORM_FIELD_KIND_SIGNATURE);
+    const std::string type = w.value("field_type", "");
+    uint32_t flags = 0;
+    if (w.contains("field_flags") && w["field_flags"].is_number_integer()) {
+      flags = static_cast<uint32_t>(w["field_flags"].get<int64_t>());
+      field->set_flags(flags);
+      field->set_read_only((flags & kFieldFlagReadOnly) != 0);
     }
+    const pdfv1::FormFieldKind kind = FieldKind(type, flags);
+    field->set_kind(kind);
     field->set_name(w.value("field_name", ""));
     std::string value = w.value("text", "");
+    // A button's /V is a name, which the engine spells with its slash;
+    // the other backends (PDFium, poppler) report the bare state name, so
+    // this one does too.
+    if ((kind == pdfv1::FORM_FIELD_KIND_CHECK_BOX ||
+         kind == pdfv1::FORM_FIELD_KIND_RADIO_BUTTON) &&
+        value.starts_with('/')) {
+      value.erase(0, 1);
+    }
     if (!value.empty()) field->set_value(value);
     std::string desc = w.value("description", "");
     if (!desc.empty()) field->set_alternate_name(desc);
+    std::string state = w.value("appearance_state", "");
+    if (!state.empty()) field->set_appearance_state(state);
     auto* box = field->mutable_rect();
     box->set_x0(NumberOr(w, "x0", 0.0));
     box->set_y0(NumberOr(w, "y0", 0.0));
