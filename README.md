@@ -76,9 +76,10 @@ run before any push: the library closure resolves inside the image (the
 dynamic loader reports it, since the base has no `ldd`), the server
 reaches its "listening on" line under `--read-only --cap-drop ALL` (which
 also proves the engine found its font resources), and every process runs
-as uid 65532. amd64 only, like the family's other C++ services. The
-publish workflow pushes `docker.io/pipestreamai/grpc-qparse:latest` on
-every push to main.
+as uid 65532. Published as a linux/amd64 + linux/arm64 manifest list, each
+leg built and smoke-tested natively on its own architecture (the arm64 leg
+runs on GitHub's hosted arm64 runner). The publish workflow pushes
+`docker.io/pipestreamai/grpc-qparse:latest` on every push to main.
 
 ## Content-addressed documents
 

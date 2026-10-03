@@ -48,11 +48,14 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   under `/usr/local/lib` on `LD_LIBRARY_PATH`. The build stage must stay on
   a glibc no newer than the runtime base's (2.41); a build on ubuntu 26.04
   produces a binary the base cannot load. `GRPC_QPARSE_RUNTIME_IMAGE`
-  swaps the base. Builds amd64 only, like the family's other C++ services.
-  `scripts/smoke-test.sh IMAGE` is the boot gate (closure, boot to
-  listening under the hardened flags, uid); `ci.yml` runs the image build
-  then the smoke test, and `.github/workflows/publish.yml` builds,
-  smoke-tests, and only then pushes
+  swaps the base. Published as a linux/amd64 + linux/arm64 manifest list,
+  each leg built and smoke-tested natively on its own architecture; the
+  arm64 leg runs on GitHub's hosted `ubuntu-24.04-arm` runner. `scripts/smoke-test.sh IMAGE`
+  is the boot gate (closure, boot to listening under the hardened flags,
+  uid); `ci.yml` runs the image build then the smoke test, and
+  `.github/workflows/publish.yml` builds each platform leg, pushes it by
+  digest only, boot-proofs the pushed digest, and only then assembles the
+  passing digests into
   `docker.io/pipestreamai/grpc-qparse:latest` on every push to main (plus
   a `:<version>` tag on manual dispatch) with the
   `DOCKER_USER`/`DOCKER_TOKEN` org secrets, passing the ref name as the
