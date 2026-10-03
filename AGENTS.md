@@ -92,3 +92,9 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   or the commit sha on a push, as the `GRPC_QPARSE_BUILD_VERSION` build arg
   so the image reports which build it is. `ci.yml` and `publish.yml` both
   run with a read-only `contents` token.
+- Supply-chain pins: every workflow action is pinned to the commit its
+  release tag names (the tag in a trailing comment), every Dockerfile base
+  (the `# syntax` frontend, the build stage, the runtime default) to its
+  manifest-list digest beside the tag, and the shallow gRPC clone is
+  checked against the commit `v1.83.1` named at configure time. Bump a
+  tag and its pin together.

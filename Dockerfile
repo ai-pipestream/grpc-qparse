@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.27
+# syntax=docker/dockerfile:1.27@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # grpc-qparse image: the qpdf-based cell-parser PDF backend, published as a
 # linux/amd64 + linux/arm64 manifest list (each leg built and smoke-tested
 # natively on its own architecture).
@@ -19,13 +19,18 @@
 # to load there. The base is swappable for any image whose glibc is 2.41 or
 # newer:
 #   --build-arg GRPC_QPARSE_RUNTIME_IMAGE=<image>
-ARG GRPC_QPARSE_RUNTIME_IMAGE=dhi.io/debian-base:trixie-debian13
+#
+# Every base (the frontend above, the build stage and the runtime stage) is
+# pinned to the manifest-list digest its tag named when it was pinned, so a
+# moved tag cannot change what is built; the tag stays for the reader.
+# Bump tag and digest together (docker buildx imagetools inspect <tag>).
+ARG GRPC_QPARSE_RUNTIME_IMAGE=dhi.io/debian-base:trixie-debian13@sha256:20079b51710f0397da5e056bfc7156b6aafc7ff3aa4ef4cbcb0b0f1df99cd8c4
 
 # The image tag passed by the publish workflow; becomes build_version in
 # GetServiceInfo.
 ARG GRPC_QPARSE_BUILD_VERSION=dev
 
-FROM debian:trixie-slim AS build
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates cmake g++ git make pkg-config zlib1g-dev \
