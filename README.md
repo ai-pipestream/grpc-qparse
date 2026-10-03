@@ -5,20 +5,52 @@ implementing the fleet's common `PdfBackendService` contract
 (`ai.protomolt.parse.pdf.v1`, from the parser-protos commit this
 build pins). The wrapper is Apache-2.0; the engine and its dependency set
 (qpdf, blend2d, freetype, openjpeg, lcms2, libjpeg) are all permissive.
+`NOTICE` lists every component the image redistributes with its license,
+and the image carries their license texts under
+`/usr/local/share/doc/grpc-qparse`.
 
 What this backend is for: reading-order text cells (its sanitizers merge
 raw chars into model-ready cells with direction, space width and rendering
 mode), vector shapes, embedded font programs, plus the tier 0 floor: typed
-load status, page inventory, and blend2d page rasters (RGBA8). Placed
-images, hyperlinks, form-field widgets, the outline, and the XMP packet
-ride along. Families the engine's public surface does not expose
-(annotations as typed data, encryption details, attachments, signatures,
-JavaScript, the structure tree, thumbnails, and its internal resource
-dictionaries) are reported unsupported in `Probe`, each with a reason.
+load status, page inventory, and blend2d page rasters (RGBA8, BGRA8, RGB8,
+BGR8 or GRAY8, as requested). Placed images, hyperlinks, form-field
+widgets, the outline, and the XMP packet ride along. Families the engine's
+public surface does not expose (annotations as typed data, encryption
+details, attachments, signatures, JavaScript, the structure tree,
+thumbnails, and its internal resource dictionaries) are reported
+unsupported in `Probe`, each with a reason.
+
+Every geometry is in the contract's frame: unrotated PDF user space
+shifted so the CropBox's lower-left corner is (0, 0). `PageInfo` says so
+with `page_space = PAGE_SPACE_CROP_BOX` and carries the page's true
+`/Rotate` and its MediaBox and CropBox as stored.
+A font id names one font for the whole stream: a cell's `font_id` is the
+id of the `EmbeddedFont` that carries its program, and two subsets that
+share a name but not a program get two ids. `PDF_FAMILY_FONTS` sends the
+font table; programs are decoded and sent, once each, only when
+`PDF_FAMILY_EMBEDDED_FONTS` is requested. A `FontRef` is marked
+`embedded` whenever its font dictionary carries a program (`/FontFile`,
+`/FontFile2` or `/FontFile3`), whether or not the call decodes it.
+
+A document that does not open gets the typed verdict qpdf's error code
+gives: `LOAD_STATUS_PASSWORD_REQUIRED` for an encrypted file opened
+without a password, `LOAD_STATUS_PASSWORD_INCORRECT` when the password
+given does not open it, `LOAD_STATUS_CORRUPT` for damage qpdf cannot
+recover from, and `LOAD_STATUS_ENGINE_ERROR` for anything else.
 
 The engine is safe to use concurrently through independent per-request
 decoder instances, so the service is plain thread-per-request; there is no
-worker-process pool here.
+worker-process pool here. A cap on concurrent `Parse` and `Render` calls
+bounds memory instead: one `Render` at the full pixel budget holds about
+2 GiB (the canvas, its copy, the message and gRPC's serialized buffer). A
+call over the cap waits for a slot no longer than its client does, nor
+than the queue timeout, and then fails `RESOURCE_EXHAUSTED`. `Probe` and
+`GetServiceInfo` are not capped.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GRPC_QPARSE_MAX_CONCURRENT_CALLS` | half the cores, at least 2 | `Parse` and `Render` calls running at once; unset, 0 or unparseable keeps the default. Lower it when the container has less than about 2 GiB per call. |
+| `GRPC_QPARSE_QUEUE_TIMEOUT_S` | 300 | Seconds a call waits for a slot; 0 leaves only the client's deadline. A value that is not whole seconds up to 604800 (a week) keeps the default. |
 
 ## Build and test
 
@@ -44,9 +76,14 @@ GRPC_QPARSE_PORT=50070 GRPC_QPARSE_RESOURCES=./build/pdf_resources ./build/grpc_
 workspace `AGENTS.md`); `GRPC_QPARSE_PORT` overrides it.
 
 `GRPC_QPARSE_RESOURCES` points at the engine's font resource directory
-(staged into the build tree at configure time). Health and server
-reflection are enabled; `Probe`, `Parse`, `Render`, and `GetServiceInfo`
-are the service surface.
+(staged into the build tree at configure time). It also holds the
+rasterizer's fallback faces under `fonts/fallback`: Liberation Sans, Serif
+and Mono 2.1.5 (SIL OFL 1.1, license beside them), downloaded at configure
+time from the pinned release and sha256-verified. Text in a font the PDF
+does not embed, the standard 14 included, is drawn with them; without
+them it would rasterize as outline boxes, since the runtime image has no
+system fonts. Health and server reflection are enabled; `Probe`, `Parse`,
+`Render`, and `GetServiceInfo` are the service surface.
 
 ## Docker
 
@@ -75,10 +112,13 @@ container runs read-only without a tmpfs.
 run before any push: the library closure resolves inside the image (the
 dynamic loader reports it, since the base has no `ldd`), the server
 reaches its "listening on" line under `--read-only --cap-drop ALL` (which
-also proves the engine found its font resources), and every process runs
-as uid 65532. Published as a linux/amd64 + linux/arm64 manifest list, each
-leg built and smoke-tested natively on its own architecture (the arm64 leg
-runs on GitHub's hosted arm64 runner). The publish workflow pushes
+also proves the engine found its font resources), every process runs as
+uid 65532, and the license texts are in the image
+(`scripts/collect-notices.sh` gathers them in the build stage and fails
+the build if one has moved). Published as a linux/amd64 + linux/arm64
+manifest list, each leg built and smoke-tested natively on its own
+architecture (the arm64 leg runs on GitHub's hosted arm64 runner). The
+publish workflow pushes
 `docker.io/pipestreamai/grpc-qparse:latest` on every push to main.
 
 ## Content-addressed documents
@@ -103,3 +143,41 @@ Cache bounds come from the environment:
 
 Eviction is least-recently-used. Cache lifetime is the process lifetime;
 the contract promises only the verdicts, never retention.
+
+## Page ranges
+
+A set `PageRange` must have `end` greater than `begin`, the contract's one
+rule for it; anything else fails `Parse` and `Render` with
+`INVALID_ARGUMENT` before a message streams. Every other range is valid:
+an `end` past the document stops at its last page, and a range that starts
+past it selects no page, however large its `begin`.
+
+## Render bounds
+
+`Render` takes a positive finite `dpi`; anything else (zero, negative,
+NaN, infinity) is `INVALID_ARGUMENT`. Before it renders a page it sizes
+every page in the range, and a page whose raster would be wider or taller
+than 65535 pixels (the rasterizer's limit) or larger than the pixel budget
+fails the whole call with `RESOURCE_EXHAUSTED`, before any raster streams.
+A page the engine or the rasterizer fails on is skipped and the rest of
+the range still renders; the contract has no per-page warning on the
+Render stream, so the service logs the skipped page's index and the
+reason at ERROR. The budget comes from the environment:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GRPC_QPARSE_RENDER_MAX_PIXELS` | 134217728 (2^27) | Pixels one page's raster may have; also the ceiling, since a 2^27-pixel RGBA raster is the most one 520 MiB message carries. Also the most pixels an image XObject (or its soft mask) may declare. |
+| `GRPC_QPARSE_MAX_DECODED_STREAM_BYTES` | 536870912 (512 MiB) | Bytes one Flate, RunLength or LZW stream may decode to, on every RPC, and the memory jpeglib may use for a DCT stream qpdf decodes; qpdf holds it process-wide. |
+
+Image samples are bounded before they are decoded. An image XObject a
+page reaches (through its forms, patterns and Type3 fonts too) that
+declares more pixels than the budget, or whose `/SMask` or `/Mask` does,
+is left out of the page before the engine decodes it, and the service
+logs which one at ERROR; the page renders without it. `/Width` and
+`/Height` count whether they are integers or reals, as the engine reads
+both. A stream that inflates past the decoded stream limit, whatever size
+it declares, is cut off there and treated as undecodable. qpdf's own
+`/LZWDecode` has no such limit, so the service registers a replacement
+that has; qpdf's other decoders (ASCIIHex, ASCII85, Crypt) never give more
+than four bytes per input byte. `Parse` never decodes image
+samples, so it still reports every image's placement and size.

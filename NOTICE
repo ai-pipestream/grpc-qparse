@@ -1,0 +1,46 @@
+grpc-qparse
+Copyright 2026 ai.pipestream
+
+This product includes software developed at ai.pipestream.
+
+The container image built from this repository redistributes the
+third-party software below in compiled form, and the rasterizer's fallback
+fonts as files. Their license texts ship in the image under
+/usr/local/share/doc/grpc-qparse/third_party/<component>/, collected at
+build time by scripts/collect-notices.sh, which fails the build when one
+is missing.
+
+  Component                                  License
+  docling-parse, the PDF engine              MIT
+  PDFium JBIG2 decoder, inside docling-parse BSD-3-Clause
+  Adobe CMap resources, inside docling-parse BSD-3-Clause
+  qpdf                                       Apache-2.0
+  Blend2D, AsmJit                            Zlib
+  FreeType                                   FreeType License (FTL)
+  libjpeg-turbo                              IJG, BSD-3-Clause, Zlib
+  OpenJPEG                                   BSD-2-Clause
+  Little CMS 2                               MIT
+  nlohmann/json, cxxopts                     MIT
+  utfcpp                                     BSL-1.0
+  loguru                                     public domain (Unlicense)
+  gRPC, Abseil, BoringSSL                    Apache-2.0 (BoringSSL support
+                                             code under the terms in its
+                                             LICENSE)
+  Protocol Buffers, RE2                      BSD-3-Clause
+  address_sorting (gRPC)                     BSD-3-Clause
+  xxHash (gRPC)                              BSD-2-Clause
+  utf8_range, c-ares                         MIT
+  zlib, vendored by gRPC and from Debian     Zlib
+  libstdc++, libgcc_s, from Debian GCC 14    GPL-3.0-or-later with the GCC
+                                             Runtime Library Exception
+  Liberation Fonts 2.1.5                     SIL Open Font License 1.1
+
+Portions of this software are copyright (C) The FreeType Project
+(www.freetype.org). All rights reserved.
+
+This software is based in part on the work of the Independent JPEG Group.
+
+docling-parse vendors the PDFium JBIG2 decoder without PDFium's license
+file. third_party/pdfium/LICENSE is that file as published at
+https://pdfium.googlesource.com/pdfium/+/refs/heads/main/LICENSE
+(fetched 2026-10-02).

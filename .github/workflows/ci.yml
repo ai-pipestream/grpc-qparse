@@ -9,6 +9,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# The jobs only read the repository; the token gets nothing more.
+permissions:
+  contents: read
+
 jobs:
   image:
     name: image ${{ matrix.runner }}

@@ -10,6 +10,7 @@
 #   2. boot: the server reaches its own "listening on" line under the
 #      hardened run flags (read-only rootfs, no capabilities), which also
 #      proves the engine found its font resources, and runs as uid 65532.
+#   3. notices: the license texts the image redistributes are in it.
 set -euo pipefail
 
 usage() {
@@ -64,5 +65,15 @@ if [[ -n "$foreign_uid" ]]; then
   echo "a process is not running as uid 65532" >&2
   exit 1
 fi
+
+echo "== smoke: third-party notices ship in the image"
+notices=$(docker cp "$container:/usr/local/share/doc/grpc-qparse" - | tar -t)
+for expected in NOTICE LICENSE third_party/freetype/FTL.TXT \
+    third_party/liberation-fonts/LICENSE third_party/docling-parse/LICENSE; do
+  if ! grep -qx "grpc-qparse/$expected" <<<"$notices"; then
+    echo "missing from the image: /usr/local/share/doc/grpc-qparse/$expected" >&2
+    exit 1
+  fi
+done
 
 echo "smoke-test: OK ($image)"

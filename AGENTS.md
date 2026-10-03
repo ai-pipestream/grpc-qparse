@@ -22,6 +22,21 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   `resource_utils::set_resources_dir`) or decode throws `map::at`. Never
   expand a truncated engine commit hash from memory; take it from
   `git rev-parse`.
+- Page geometry follows the contract frame: every cell, quad, shape, image,
+  link and widget is in unrotated PDF user space shifted so the CropBox's
+  lower-left corner is (0, 0), `PageInfo.page_space` is
+  `PAGE_SPACE_CROP_BOX` on every page, `PageInfo.rotation_degrees` is the
+  page's own or inherited `/Rotate`, and `media_box`/`crop_box` are the
+  unrotated boxes as stored (absolute). gRParse's `PageFrame` maps that frame onto the rendered page. The engine
+  would rotate items into display orientation and drop the angle, so pages
+  are decoded through the service's own qpdf handle (`DocumentPages` in
+  `src/qparse_service_impl.cpp`) with `/Rotate` held at 0 and the inherited
+  boxes pinned on the page; Render hands the rotation to the rasterizer
+  through the size instruction. Do not go back to the engine's document
+  `decode_page`. The page inventory comes from the page dictionaries, so a
+  Parse header never decodes content, and a call decodes only the pages in
+  its range (checking for cancellation between pages).
+  `test/fixtures/frames.pdf` (`make_frames_pdf.py`) pins all of this.
 - The content-addressed handshake (`PdfDocument.sha256`) is served by an
   in-memory LRU byte cache in the server process
   (`src/document_cache.{h,cpp}`), shared by Probe, Parse and Render through
@@ -31,6 +46,14 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   self-contained `src/sha256.cpp` on purpose: gRPC links its vendored
   BoringSSL statically, and adding a second crypto library risks duplicate
   symbol definitions.
+- Memory bounds: `src/call_slots.{h,cpp}` caps concurrent Parse and Render
+  calls (`GRPC_QPARSE_MAX_CONCURRENT_CALLS`, default max(2, cores / 2);
+  `GRPC_QPARSE_QUEUE_TIMEOUT_S`, default 300, then RESOURCE_EXHAUSTED).
+  `GRPC_QPARSE_MAX_DECODED_STREAM_BYTES` bounds every qpdf decoder that can
+  inflate: Flate and RunLength through qpdf's own limits, DCT through
+  jpeglib's, and LZW through the replacement filter in
+  `src/lzw_filter.{h,cpp}` (qpdf's has no limit). `test/fixtures/bomb.pdf`
+  and `lzw.pdf` pin these.
 - Default port is 50070 (`GRPC_QPARSE_PORT` overrides), the fleet-registered
   assignment in the workspace table; the backend fleet used to collide with
   gRParse/grPOIc/grpc-libreoffice on 50051-50053.
@@ -43,9 +66,16 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   toolchain) compiles and runs ctest as the image gate; the runtime is the
   hardened `dhi.io/debian-base:trixie-debian13` base (glibc only, no
   package manager, no ldconfig, uid 65532) carrying the binary, the engine
-  font resources under `/usr/local/share/grpc-qparse/pdf_resources`, and
+  font resources under `/usr/local/share/grpc-qparse/pdf_resources` (with
+  the pinned Liberation fallback faces in `fonts/fallback`, which the
+  rasterizer needs for every non-embedded font because the base has no
+  system fonts; the render test checks for real glyph ink), and
   the staged shared-library closure (`scripts/stage-runtime-libs.sh`)
-  under `/usr/local/lib` on `LD_LIBRARY_PATH`. The build stage must stay on
+  under `/usr/local/lib` on `LD_LIBRARY_PATH`, plus `LICENSE`, `NOTICE`
+  and each redistributed component's license text under
+  `/usr/local/share/doc/grpc-qparse` (`scripts/collect-notices.sh`, which
+  fails the build when a listed file is missing; a new dependency needs a
+  line there and in `NOTICE`). The build stage must stay on
   a glibc no newer than the runtime base's (2.41); a build on ubuntu 26.04
   produces a binary the base cannot load. `GRPC_QPARSE_RUNTIME_IMAGE`
   swaps the base. Published as a linux/amd64 + linux/arm64 manifest list,
@@ -58,5 +88,7 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   passing digests into
   `docker.io/pipestreamai/grpc-qparse:latest` on every push to main (plus
   a `:<version>` tag on manual dispatch) with the
-  `DOCKER_USER`/`DOCKER_TOKEN` org secrets, passing the ref name as the
-  `GRPC_QPARSE_BUILD_VERSION` build arg so the image reports its tag.
+  `DOCKER_USER`/`DOCKER_TOKEN` org secrets, passing the dispatch version,
+  or the commit sha on a push, as the `GRPC_QPARSE_BUILD_VERSION` build arg
+  so the image reports which build it is. `ci.yml` and `publish.yml` both
+  run with a read-only `contents` token.
