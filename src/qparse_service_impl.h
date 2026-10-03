@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <string>
 
 #include <grpcpp/grpcpp.h>
@@ -46,8 +48,14 @@ class QparseServiceImpl final
       const ai::protomolt::parse::pdf::v1::ServiceInfoRequest* request,
       ai::protomolt::parse::pdf::v1::ServiceInfoResponse* response) override;
 
+  // Pages the engine has decoded since the service started, across Parse
+  // and Render. A call decodes only the pages its range names; tests read
+  // this to prove it.
+  uint64_t decoded_pages() const { return decoded_pages_.load(); }
+
  private:
   DocumentCache cache_;
+  std::atomic<uint64_t> decoded_pages_{0};
 };
 
 }  // namespace grpc_qparse

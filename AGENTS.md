@@ -22,6 +22,20 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   `resource_utils::set_resources_dir`) or decode throws `map::at`. Never
   expand a truncated engine commit hash from memory; take it from
   `git rev-parse`.
+- Page geometry follows the contract frame: every cell, quad, shape, image,
+  link and widget is in unrotated PDF user space (absolute, not shifted to
+  the CropBox origin), `PageInfo.rotation_degrees` is the page's own or
+  inherited `/Rotate`, and `media_box`/`crop_box` are the unrotated boxes.
+  gRParse's `PageFrame` maps that frame onto the rendered page. The engine
+  would rotate items into display orientation and drop the angle, so pages
+  are decoded through the service's own qpdf handle (`DocumentPages` in
+  `src/qparse_service_impl.cpp`) with `/Rotate` held at 0 and the inherited
+  boxes pinned on the page; Render hands the rotation to the rasterizer
+  through the size instruction. Do not go back to the engine's document
+  `decode_page`. The page inventory comes from the page dictionaries, so a
+  Parse header never decodes content, and a call decodes only the pages in
+  its range (checking for cancellation between pages).
+  `test/fixtures/frames.pdf` (`make_frames_pdf.py`) pins all of this.
 - The content-addressed handshake (`PdfDocument.sha256`) is served by an
   in-memory LRU byte cache in the server process
   (`src/document_cache.{h,cpp}`), shared by Probe, Parse and Render through

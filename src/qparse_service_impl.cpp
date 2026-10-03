@@ -1,12 +1,18 @@
 #include "qparse_service_impl.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <map>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
+
+#include <qpdf/QPDF.hh>
+#include <qpdf/QPDFObjectHandle.hh>
+#include <qpdf/QPDFPageObjectHelper.hh>
 
 // The engine umbrella headers (header-only library over qpdf).
 #include <parse.h>
@@ -63,11 +69,165 @@ const char* UnsupportedDetail(pdfv1::PdfFamily family) {
   }
 }
 
+// Page geometry as PageInfo reports it, read from the page dictionary with
+// inheritance through the page tree resolved: /MediaBox, /CropBox and
+// /Rotate may sit on any ancestor /Pages node (ISO 32000-1, 7.7.3.4).
+struct PageGeometry {
+  // The MediaBox, lower-left corner first; US Letter when the page has no
+  // usable one, as PDFium falls back.
+  std::array<double, 4> media_box = {0.0, 0.0, 612.0, 792.0};
+  // The CropBox clipped to the MediaBox: the part of the page a viewer
+  // shows and the renderer draws. The MediaBox when the page sets none.
+  std::array<double, 4> crop_box = {0.0, 0.0, 612.0, 792.0};
+  // /Rotate as whole clockwise quarter turns: 0, 90, 180 or 270.
+  int rotation = 0;
+
+  // The displayed size: the CropBox, turned with the page.
+  double DisplayWidth() const {
+    return rotation % 180 == 0 ? crop_box[2] - crop_box[0]
+                               : crop_box[3] - crop_box[1];
+  }
+  double DisplayHeight() const {
+    return rotation % 180 == 0 ? crop_box[3] - crop_box[1]
+                               : crop_box[2] - crop_box[0];
+  }
+};
+
+// A page box: four finite numbers spanning a non-empty area, normalized so
+// the lower-left corner comes first.
+std::optional<std::array<double, 4>> RectangleOf(QPDFObjectHandle box) {
+  if (!box.isArray() || box.getArrayNItems() != 4) return std::nullopt;
+  std::array<double, 4> v{};
+  for (int i = 0; i < 4; ++i) {
+    QPDFObjectHandle item = box.getArrayItem(i);
+    if (!item.isNumber()) return std::nullopt;
+    v[static_cast<size_t>(i)] = item.getNumericValue();
+    if (!std::isfinite(v[static_cast<size_t>(i)])) return std::nullopt;
+  }
+  const std::array<double, 4> rect = {
+      std::min(v[0], v[2]), std::min(v[1], v[3]), std::max(v[0], v[2]),
+      std::max(v[1], v[3])};
+  if (!(rect[0] < rect[2] && rect[1] < rect[3])) return std::nullopt;
+  return rect;
+}
+
+// /Rotate read the way PDFium reads it: whole quarter turns clockwise, a
+// negative value wrapping around.
+int RotationOf(QPDFObjectHandle rotate) {
+  long long degrees = 0;
+  if (rotate.isInteger()) {
+    degrees = rotate.getIntValue();
+  } else if (rotate.isReal()) {
+    const double value = rotate.getNumericValue();
+    if (std::isfinite(value) && std::fabs(value) < 1e9) {
+      degrees = static_cast<long long>(value);
+    }
+  }
+  long long quarter_turns = (degrees / 90) % 4;
+  if (quarter_turns < 0) quarter_turns += 4;
+  return static_cast<int>(quarter_turns * 90);
+}
+
+PageGeometry ReadPageGeometry(QPDFObjectHandle page) {
+  QPDFPageObjectHelper helper(page);
+  PageGeometry geometry;
+  if (auto media = RectangleOf(helper.getAttribute("/MediaBox", false))) {
+    geometry.media_box = *media;
+  }
+  geometry.crop_box = geometry.media_box;
+  if (auto crop = RectangleOf(helper.getAttribute("/CropBox", false))) {
+    const std::array<double, 4>& media = geometry.media_box;
+    const std::array<double, 4> visible = {
+        std::max((*crop)[0], media[0]), std::max((*crop)[1], media[1]),
+        std::min((*crop)[2], media[2]), std::min((*crop)[3], media[3])};
+    if (visible[0] < visible[2] && visible[1] < visible[3]) {
+      geometry.crop_box = visible;
+    }
+  }
+  geometry.rotation = RotationOf(helper.getAttribute("/Rotate", false));
+  return geometry;
+}
+
+QPDFObjectHandle BoxArray(const std::array<double, 4>& box) {
+  return QPDFObjectHandle::newArray(
+      QPDFObjectHandle::Rectangle(box[0], box[1], box[2], box[3]));
+}
+
+// The document's pages for Parse and Render, on a qpdf handle of the
+// call's own beside the engine's document decoder. The inventory comes
+// from the page dictionaries without decoding any content; a page's
+// content is decoded only when the call reaches it.
+class DocumentPages {
+ public:
+  // Opens the bytes, which must outlive this object: qpdf reads them in
+  // place. Returns false with qpdf's message when the bytes do not open.
+  bool Open(const std::string& bytes, const std::optional<std::string>& password,
+            std::string* error) {
+    try {
+      qpdf_.setSuppressWarnings(true);
+      qpdf_.processMemoryFile("grpc-qparse request", bytes.data(), bytes.size(),
+                              password.has_value() ? password->c_str() : nullptr);
+      pages_ = qpdf_.getAllPages();
+      geometry_.reserve(pages_.size());
+      for (const auto& page : pages_) geometry_.push_back(ReadPageGeometry(page));
+    } catch (const std::exception& e) {
+      *error = e.what();
+      return false;
+    }
+    return true;
+  }
+
+  int page_count() const { return static_cast<int>(pages_.size()); }
+
+  const PageGeometry& geometry(int index) const {
+    return geometry_.at(static_cast<size_t>(index));
+  }
+
+  // Decodes one page. The engine reads /CropBox and /Rotate from the page
+  // dictionary alone, never through the page tree, and on a rotated page it
+  // turns every cell, shape and image into display orientation and drops
+  // the angle. Here it decodes the page with the boxes resolved above and
+  // /Rotate 0, so every item stays in unrotated user space, the contract's
+  // frame; Render passes the rotation to the rasterizer instead. The edits
+  // touch only this call's qpdf objects, never the bytes.
+  std::shared_ptr<pdflib::pdf_decoder<pdflib::PAGE>> Decode(
+      int index, const pdflib::decode_config& config) {
+    QPDFObjectHandle page = pages_.at(static_cast<size_t>(index));
+    const PageGeometry& page_geometry = geometry(index);
+    page.replaceKey("/MediaBox", BoxArray(page_geometry.media_box));
+    page.replaceKey("/CropBox", BoxArray(page_geometry.crop_box));
+    page.replaceKey("/Rotate", QPDFObjectHandle::newInteger(0));
+    // The engine also looks for /Resources on the page and its direct
+    // parent only; resources inherited from further up are pinned on the
+    // page.
+    if (!page.hasKey("/Resources")) {
+      QPDFObjectHandle parent = page.getKey("/Parent");
+      if (!(parent.isDictionary() && parent.hasKey("/Resources"))) {
+        QPDFObjectHandle inherited =
+            QPDFPageObjectHelper(page).getAttribute("/Resources", false);
+        if (inherited.isDictionary()) page.replaceKey("/Resources", inherited);
+      }
+    }
+    auto decoder =
+        std::make_shared<pdflib::pdf_decoder<pdflib::PAGE>>(page, index);
+    decoder->decode_page(config);
+    return decoder;
+  }
+
+ private:
+  QPDF qpdf_;
+  std::vector<QPDFObjectHandle> pages_;
+  std::vector<PageGeometry> geometry_;
+};
+
 struct LoadedDocument {
   pdflib::pdf_timings timings;
   std::unique_ptr<pdflib::pdf_decoder<pdflib::DOCUMENT>> doc;
   // The resolved document bytes; kept alive for the engine's decode.
   std::shared_ptr<std::string> buffer;
+  // Per-page access for Parse and Render. It reads buffer in place, so it
+  // is declared after it and destroyed first.
+  std::unique_ptr<DocumentPages> pages;
   pdfv1::LoadStatus status = pdfv1::LOAD_STATUS_UNSPECIFIED;
   std::string detail;
 };
@@ -114,7 +274,10 @@ ResolveOutcome ResolveDocumentBytes(const pdfv1::PdfDocument& request,
   return ResolveOutcome::kOk;
 }
 
-void LoadDocument(const pdfv1::PdfDocument& request, LoadedDocument* out) {
+// Opens the resolved bytes in the engine; with_pages also opens the
+// per-page handle Parse and Render work through.
+void LoadDocument(const pdfv1::PdfDocument& request, bool with_pages,
+                  LoadedDocument* out) {
   const std::string& data = *out->buffer;
   if (data.rfind("%PDF-", 0) != 0) {
     out->status = pdfv1::LOAD_STATUS_NOT_PDF;
@@ -131,6 +294,11 @@ void LoadDocument(const pdfv1::PdfDocument& request, LoadedDocument* out) {
                                                  "grpc-qparse request");
   } catch (const std::exception& e) {
     out->detail = e.what();
+  }
+  if (ok && with_pages) {
+    out->pages = std::make_unique<DocumentPages>();
+    ok = out->pages->Open(data, password, &out->detail);
+    if (!ok) out->pages.reset();
   }
   if (ok) {
     out->status = pdfv1::LOAD_STATUS_OK;
@@ -183,39 +351,39 @@ double NumberOr(const nlohmann::json& j, const char* key, double fallback) {
   return it != j.end() && it->is_number() ? it->get<double>() : fallback;
 }
 
-void FillBoxFromArray(const nlohmann::json& arr, pdfv1::BoundingBox* box) {
-  if (!arr.is_array() || arr.size() != 4) return;
-  box->set_x0(arr[0].get<double>());
-  box->set_y0(arr[1].get<double>());
-  box->set_x1(arr[2].get<double>());
-  box->set_y1(arr[3].get<double>());
+// Sets an axis-aligned box from two corners in either order; annotation
+// rectangles may be stored with any pair of opposite corners.
+void SetBox(double x0, double y0, double x1, double y1,
+            pdfv1::BoundingBox* box) {
+  box->set_x0(std::min(x0, x1));
+  box->set_y0(std::min(y0, y1));
+  box->set_x1(std::max(x0, x1));
+  box->set_y1(std::max(y0, y1));
 }
 
-void FillPageInfo(const nlohmann::json& dim, int index, pdfv1::PageInfo* info) {
-  info->set_page_index(static_cast<uint32_t>(index));
-  const auto& bbox = dim["bbox"];
-  double width = NumberOr(dim, "width", 0.0);
-  double height = NumberOr(dim, "height", 0.0);
-  if (width == 0.0 && bbox.is_array() && bbox.size() == 4) {
-    width = bbox[2].get<double>() - bbox[0].get<double>();
-  }
-  if (height == 0.0 && bbox.is_array() && bbox.size() == 4) {
-    height = bbox[3].get<double>() - bbox[1].get<double>();
-  }
-  info->set_width_pts(width);
-  info->set_height_pts(height);
-  int angle = static_cast<int>(NumberOr(dim, "angle", 0.0));
-  info->set_rotation_degrees(((angle % 360) + 360) % 360);
-  if (dim.contains("rectangles")) {
-    const auto& rects = dim["rectangles"];
-    if (rects.contains("media-bbox")) {
-      FillBoxFromArray(rects["media-bbox"], info->mutable_media_box());
-    }
-    if (rects.contains("crop-bbox")) {
-      FillBoxFromArray(rects["crop-bbox"], info->mutable_crop_box());
-    }
-  }
+void SetBox(const std::array<double, 4>& corners, pdfv1::BoundingBox* box) {
+  SetBox(corners[0], corners[1], corners[2], corners[3], box);
 }
+
+// PageInfo straight from the page dictionary: the size after /Rotate, the
+// true (inherited) /Rotate, and the boxes in unrotated user space.
+void FillPageInfo(const PageGeometry& geometry, int index,
+                  pdfv1::PageInfo* info) {
+  info->set_page_index(static_cast<uint32_t>(index));
+  info->set_width_pts(geometry.DisplayWidth());
+  info->set_height_pts(geometry.DisplayHeight());
+  info->set_rotation_degrees(geometry.rotation);
+  SetBox(geometry.media_box, info->mutable_media_box());
+  SetBox(geometry.crop_box, info->mutable_crop_box());
+}
+
+// Where a decoded page's sanitized cells, shapes and images sit: the engine
+// moves them to the origin of its page boundary (the MediaBox, see
+// ParseDecodeConfig), and the contract wants them back in user space.
+struct UserSpaceOffset {
+  double dx = 0.0;
+  double dy = 0.0;
+};
 
 // Column indices resolved from a header+data table once per table.
 int ColumnIndex(const nlohmann::json& header, const std::string& name) {
@@ -244,9 +412,9 @@ class FontInterner {
   std::map<std::string, uint32_t> ids_;
 };
 
-void FillTextCells(const nlohmann::json& cells, FontInterner* fonts,
-                   pdfv1::PageChunk* chunk, pdfv1::FontTableChunk* new_fonts,
-                   uint64_t* cell_count) {
+void FillTextCells(const nlohmann::json& cells, const UserSpaceOffset& offset,
+                   FontInterner* fonts, pdfv1::PageChunk* chunk,
+                   pdfv1::FontTableChunk* new_fonts, uint64_t* cell_count) {
   if (!cells.contains("header") || !cells.contains("data")) return;
   const auto& header = cells["header"];
   const int ix0 = ColumnIndex(header, "x0");
@@ -269,19 +437,19 @@ void FillTextCells(const nlohmann::json& cells, FontInterner* fonts,
     auto* cell = chunk->add_text_cells();
     cell->set_text(row[itext].get<std::string>());
     auto* bbox = cell->mutable_bbox();
-    bbox->set_x0(row[ix0].get<double>());
-    bbox->set_y0(row[iy0].get<double>());
-    bbox->set_x1(row[ix1].get<double>());
-    bbox->set_y1(row[iy1].get<double>());
+    bbox->set_x0(row[ix0].get<double>() + offset.dx);
+    bbox->set_y0(row[iy0].get<double>() + offset.dy);
+    bbox->set_x1(row[ix1].get<double>() + offset.dx);
+    bbox->set_y1(row[iy1].get<double>() + offset.dy);
     auto* quad = cell->mutable_quad();
-    quad->set_x0(row[irx0 + 0].get<double>());
-    quad->set_y0(row[irx0 + 1].get<double>());
-    quad->set_x1(row[irx0 + 2].get<double>());
-    quad->set_y1(row[irx0 + 3].get<double>());
-    quad->set_x2(row[irx0 + 4].get<double>());
-    quad->set_y2(row[irx0 + 5].get<double>());
-    quad->set_x3(row[irx0 + 6].get<double>());
-    quad->set_y3(row[irx0 + 7].get<double>());
+    quad->set_x0(row[irx0 + 0].get<double>() + offset.dx);
+    quad->set_y0(row[irx0 + 1].get<double>() + offset.dy);
+    quad->set_x1(row[irx0 + 2].get<double>() + offset.dx);
+    quad->set_y1(row[irx0 + 3].get<double>() + offset.dy);
+    quad->set_x2(row[irx0 + 4].get<double>() + offset.dx);
+    quad->set_y2(row[irx0 + 5].get<double>() + offset.dy);
+    quad->set_x3(row[irx0 + 6].get<double>() + offset.dx);
+    quad->set_y3(row[irx0 + 7].get<double>() + offset.dy);
     if (iltr >= 0 && row[iltr].is_boolean()) {
       cell->set_direction(row[iltr].get<bool>()
                               ? pdfv1::TEXT_DIRECTION_LEFT_TO_RIGHT
@@ -313,7 +481,8 @@ void FillTextCells(const nlohmann::json& cells, FontInterner* fonts,
   }
 }
 
-void FillShapes(const nlohmann::json& shapes, pdfv1::PageChunk* chunk) {
+void FillShapes(const nlohmann::json& shapes, const UserSpaceOffset& offset,
+                pdfv1::PageChunk* chunk) {
   if (!shapes.is_array()) return;
   for (const auto& s : shapes) {
     if (!s.contains("x") || !s.contains("y")) continue;
@@ -321,13 +490,13 @@ void FillShapes(const nlohmann::json& shapes, pdfv1::PageChunk* chunk) {
     const auto& ys = s["y"];
     if (!xs.is_array() || xs.size() != ys.size() || xs.empty()) continue;
     auto* shape = chunk->add_shapes();
-    double min_x = xs[0].get<double>();
-    double min_y = ys[0].get<double>();
+    double min_x = xs[0].get<double>() + offset.dx;
+    double min_y = ys[0].get<double>() + offset.dy;
     double max_x = min_x;
     double max_y = min_y;
     for (size_t i = 0; i < xs.size(); ++i) {
-      double x = xs[i].get<double>();
-      double y = ys[i].get<double>();
+      double x = xs[i].get<double>() + offset.dx;
+      double y = ys[i].get<double>() + offset.dy;
       min_x = std::min(min_x, x);
       min_y = std::min(min_y, y);
       max_x = std::max(max_x, x);
@@ -367,7 +536,8 @@ void FillShapes(const nlohmann::json& shapes, pdfv1::PageChunk* chunk) {
   }
 }
 
-void FillImages(const nlohmann::json& images, pdfv1::PageChunk* chunk) {
+void FillImages(const nlohmann::json& images, const UserSpaceOffset& offset,
+                pdfv1::PageChunk* chunk) {
   if (!images.contains("header") || !images.contains("data")) return;
   const auto& header = images["header"];
   const int ix0 = ColumnIndex(header, "x0");
@@ -379,10 +549,10 @@ void FillImages(const nlohmann::json& images, pdfv1::PageChunk* chunk) {
   for (const auto& row : images["data"]) {
     auto* image = chunk->add_images();
     auto* bbox = image->mutable_bbox();
-    bbox->set_x0(row[ix0 + 0].get<double>());
-    bbox->set_y0(row[ix0 + 1].get<double>());
-    bbox->set_x1(row[ix0 + 2].get<double>());
-    bbox->set_y1(row[ix0 + 3].get<double>());
+    bbox->set_x0(row[ix0 + 0].get<double>() + offset.dx);
+    bbox->set_y0(row[ix0 + 1].get<double>() + offset.dy);
+    bbox->set_x1(row[ix0 + 2].get<double>() + offset.dx);
+    bbox->set_y1(row[ix0 + 3].get<double>() + offset.dy);
     auto* quad = image->mutable_quad();
     quad->set_x0(bbox->x0());
     quad->set_y0(bbox->y0());
@@ -420,11 +590,10 @@ void FillHyperlinks(const nlohmann::json& links, pdfv1::PageChunk* chunk) {
     if (!l.contains("uri")) continue;
     auto* link = chunk->add_hyperlinks();
     link->set_uri(l["uri"].get<std::string>());
-    auto* box = link->mutable_bbox();
-    box->set_x0(NumberOr(l, "x0", 0.0));
-    box->set_y0(NumberOr(l, "y0", 0.0));
-    box->set_x1(NumberOr(l, "x1", 0.0));
-    box->set_y1(NumberOr(l, "y1", 0.0));
+    // The link /Rect as stored: unrotated user space, the cells' frame.
+    SetBox(NumberOr(l, "x0", 0.0), NumberOr(l, "y0", 0.0),
+           NumberOr(l, "x1", 0.0), NumberOr(l, "y1", 0.0),
+           link->mutable_bbox());
   }
 }
 
@@ -485,11 +654,10 @@ void FillFormFields(const nlohmann::json& widgets, pdfv1::PageChunk* chunk) {
     if (!desc.empty()) field->set_alternate_name(desc);
     std::string state = w.value("appearance_state", "");
     if (!state.empty()) field->set_appearance_state(state);
-    auto* box = field->mutable_rect();
-    box->set_x0(NumberOr(w, "x0", 0.0));
-    box->set_y0(NumberOr(w, "y0", 0.0));
-    box->set_x1(NumberOr(w, "x1", 0.0));
-    box->set_y1(NumberOr(w, "y1", 0.0));
+    // The widget /Rect as stored: unrotated user space, the cells' frame.
+    SetBox(NumberOr(w, "x0", 0.0), NumberOr(w, "y0", 0.0),
+           NumberOr(w, "x1", 0.0), NumberOr(w, "y1", 0.0),
+           field->mutable_rect());
   }
 }
 
@@ -553,12 +721,53 @@ class EmbeddedFontCollector {
   std::set<uint32_t> emitted_;
 };
 
-pdflib::decode_config MakeDecodeConfig() {
+// Parse reports geometry and text, never image samples, so image XObjects
+// are measured but not decoded. The page boundary is the MediaBox: the
+// engine drops every cell that is not wholly inside its boundary, and a
+// cell that only straddles the CropBox edge is still on the page.
+pdflib::decode_config ParseDecodeConfig() {
+  pdflib::decode_config config;
+  config.page_boundary = "media_box";
+  config.extract_bitmap_pixels = false;
+  config.extract_font_programs = true;
+  return config;
+}
+
+pdflib::decode_config RenderDecodeConfig(float scale) {
   pdflib::decode_config config;
   config.extract_font_programs = true;
-
-
+  config.extract_bitmap_pixels = true;
+  config.bitmap_target_pixels_per_unit = scale;
   return config;
+}
+
+// The canvas the rasterizer draws: the visible CropBox, turned by the
+// page's /Rotate once drawn. The page itself was decoded unrotated.
+pdflib::size_instruction SizeInstruction(const PageGeometry& geometry) {
+  pdflib::size_instruction size;
+  size.media_bbox = geometry.media_box;
+  size.crop_bbox = geometry.crop_box;
+  size.angle = geometry.rotation;
+  return size;
+}
+
+// The page-level families, the ones that need a page decoded.
+bool WantPageItems(const pdfv1::ParseRequest& request) {
+  for (pdfv1::PdfFamily family :
+       {pdfv1::PDF_FAMILY_TEXT_CELLS, pdfv1::PDF_FAMILY_FONTS,
+        pdfv1::PDF_FAMILY_EMBEDDED_FONTS, pdfv1::PDF_FAMILY_PLACED_IMAGES,
+        pdfv1::PDF_FAMILY_VECTOR_SHAPES, pdfv1::PDF_FAMILY_HYPERLINKS,
+        pdfv1::PDF_FAMILY_FORM_FIELDS}) {
+    if (WantFamily(request, family)) return true;
+  }
+  return false;
+}
+
+void AddPageWarning(pdfv1::ParseTrailer* trailer, int page_index,
+                    const std::string& message) {
+  auto* warning = trailer->add_warnings();
+  warning->set_page_index(static_cast<uint32_t>(page_index));
+  warning->set_message(message);
 }
 
 }  // namespace
@@ -586,7 +795,7 @@ grpc::Status QparseServiceImpl::Probe(grpc::ServerContext* /*context*/,
     case ResolveOutcome::kVerdict:
       break;
     case ResolveOutcome::kOk:
-      LoadDocument(request->document(), &loaded);
+      LoadDocument(request->document(), /*with_pages=*/false, &loaded);
       break;
   }
   FillCapabilities(loaded, response->mutable_capabilities());
@@ -594,7 +803,7 @@ grpc::Status QparseServiceImpl::Probe(grpc::ServerContext* /*context*/,
 }
 
 grpc::Status QparseServiceImpl::Parse(
-    grpc::ServerContext* /*context*/, const pdfv1::ParseRequest* request,
+    grpc::ServerContext* context, const pdfv1::ParseRequest* request,
     grpc::ServerWriter<pdfv1::ParseResponse>* writer) {
   LoadedDocument loaded;
   switch (ResolveDocumentBytes(request->document(), &cache_, &loaded)) {
@@ -603,35 +812,19 @@ grpc::Status QparseServiceImpl::Parse(
     case ResolveOutcome::kVerdict:
       break;
     case ResolveOutcome::kOk:
-      LoadDocument(request->document(), &loaded);
+      LoadDocument(request->document(), /*with_pages=*/true, &loaded);
       break;
   }
-  const pdflib::decode_config config = MakeDecodeConfig();
-  int page_count =
-      loaded.status == pdfv1::LOAD_STATUS_OK ? loaded.doc->get_number_of_pages()
-                                             : 0;
+  const int page_count =
+      loaded.status == pdfv1::LOAD_STATUS_OK ? loaded.pages->page_count() : 0;
 
-  // Decode every page once; the header needs the inventory up front and
-  // the page chunks reuse the same decoders.
-  std::vector<std::shared_ptr<pdflib::pdf_decoder<pdflib::PAGE>>> decoders(
-      static_cast<size_t>(page_count));
-  std::vector<nlohmann::json> page_jsons(static_cast<size_t>(page_count));
+  // The header carries the whole inventory, read from the page
+  // dictionaries; no page content is decoded for it.
   pdfv1::ParseResponse header_msg;
   auto* header = header_msg.mutable_header();
   FillCapabilities(loaded, header->mutable_capabilities());
   for (int i = 0; i < page_count; ++i) {
-    try {
-      decoders[static_cast<size_t>(i)] = loaded.doc->decode_page(i, config);
-    } catch (const std::exception&) {
-      continue;
-    }
-    if (decoders[static_cast<size_t>(i)] == nullptr) continue;
-    page_jsons[static_cast<size_t>(i)] =
-        decoders[static_cast<size_t>(i)]->get(config);
-    const auto& pj = page_jsons[static_cast<size_t>(i)];
-    if (pj.contains("sanitized") && pj["sanitized"].contains("dimension")) {
-      FillPageInfo(pj["sanitized"]["dimension"], i, header->add_pages());
-    }
+    FillPageInfo(loaded.pages->geometry(i), i, header->add_pages());
   }
   if (!writer->Write(header_msg) || loaded.status != pdfv1::LOAD_STATUS_OK) {
     return grpc::Status::OK;
@@ -676,46 +869,78 @@ grpc::Status QparseServiceImpl::Parse(
     end = std::min<int>(static_cast<int>(request->pages().end()), page_count);
   }
 
+  const pdflib::decode_config config = ParseDecodeConfig();
+  const bool want_page_items = WantPageItems(*request);
   FontInterner fonts;
   std::map<pdfv1::PdfFamily, uint64_t> counts;
   counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] = static_cast<uint64_t>(page_count);
+  pdfv1::ParseResponse trailer_msg;
+  auto* trailer = trailer_msg.mutable_trailer();
   for (int i = begin; client_ok && i < end; ++i) {
-    auto& decoder = decoders[static_cast<size_t>(i)];
-    if (decoder == nullptr) continue;
-    const auto& pj = page_jsons[static_cast<size_t>(i)];
+    // A cancelled or expired call stops decoding at the next page.
+    if (context->IsCancelled()) {
+      return grpc::Status(grpc::StatusCode::CANCELLED,
+                          "the call was cancelled");
+    }
     pdfv1::ParseResponse page_msg;
     auto* chunk = page_msg.mutable_page();
     chunk->set_page_index(static_cast<uint32_t>(i));
     pdfv1::FontTableChunk new_fonts;
     std::vector<pdfv1::EmbeddedFont> embedded;
 
-    const auto& sanitized = pj.contains("sanitized") ? pj["sanitized"] : pj;
-    const auto& original = pj.contains("original") ? pj["original"] : pj;
-    if (WantFamily(*request, pdfv1::PDF_FAMILY_TEXT_CELLS) &&
-        sanitized.contains("cells")) {
-      FillTextCells(sanitized["cells"], &fonts, chunk, &new_fonts,
-                    &counts[pdfv1::PDF_FAMILY_TEXT_CELLS]);
-    }
-    if (WantFamily(*request, pdfv1::PDF_FAMILY_VECTOR_SHAPES) &&
-        sanitized.contains("shapes")) {
-      FillShapes(sanitized["shapes"], chunk);
-    }
-    if (WantFamily(*request, pdfv1::PDF_FAMILY_PLACED_IMAGES) &&
-        sanitized.contains("images")) {
-      FillImages(sanitized["images"], chunk);
-    }
-    if (WantFamily(*request, pdfv1::PDF_FAMILY_HYPERLINKS) &&
-        original.contains("hyperlinks")) {
-      FillHyperlinks(original["hyperlinks"], chunk);
-    }
-    if (WantFamily(*request, pdfv1::PDF_FAMILY_FORM_FIELDS) &&
-        original.contains("widgets")) {
-      FillFormFields(original["widgets"], chunk);
-    }
-    if (WantFamily(*request, pdfv1::PDF_FAMILY_FONTS) ||
-        WantFamily(*request, pdfv1::PDF_FAMILY_EMBEDDED_FONTS)) {
-      EmbeddedFontCollector collector(&fonts, &new_fonts, &embedded);
-      decoder->get_instructions().iterate_over_instructions(collector);
+    if (want_page_items) {
+      try {
+        ++decoded_pages_;
+        std::shared_ptr<pdflib::pdf_decoder<pdflib::PAGE>> decoder =
+            loaded.pages->Decode(i, config);
+        nlohmann::json pj = decoder->get(config);
+        const std::array<double, 4> media =
+            decoder->get_page_dimension().get_media_bbox();
+        const UserSpaceOffset offset{media[0], media[1]};
+
+        const auto& sanitized = pj.contains("sanitized") ? pj["sanitized"] : pj;
+        const auto& original = pj.contains("original") ? pj["original"] : pj;
+        if (WantFamily(*request, pdfv1::PDF_FAMILY_TEXT_CELLS) &&
+            sanitized.contains("cells")) {
+          FillTextCells(sanitized["cells"], offset, &fonts, chunk, &new_fonts,
+                        &counts[pdfv1::PDF_FAMILY_TEXT_CELLS]);
+        }
+        if (WantFamily(*request, pdfv1::PDF_FAMILY_VECTOR_SHAPES) &&
+            sanitized.contains("shapes")) {
+          FillShapes(sanitized["shapes"], offset, chunk);
+        }
+        if (WantFamily(*request, pdfv1::PDF_FAMILY_PLACED_IMAGES) &&
+            sanitized.contains("images")) {
+          FillImages(sanitized["images"], offset, chunk);
+        }
+        if (WantFamily(*request, pdfv1::PDF_FAMILY_HYPERLINKS) &&
+            original.contains("hyperlinks")) {
+          FillHyperlinks(original["hyperlinks"], chunk);
+        }
+        if (WantFamily(*request, pdfv1::PDF_FAMILY_FORM_FIELDS) &&
+            original.contains("widgets")) {
+          FillFormFields(original["widgets"], chunk);
+        }
+        if (WantFamily(*request, pdfv1::PDF_FAMILY_FONTS) ||
+            WantFamily(*request, pdfv1::PDF_FAMILY_EMBEDDED_FONTS)) {
+          EmbeddedFontCollector collector(&fonts, &new_fonts, &embedded);
+          decoder->get_instructions().iterate_over_instructions(collector);
+        }
+      } catch (const std::exception& e) {
+        // The page is skipped, and said so in the trailer. Font ids it
+        // already took are still announced, so later pages that share a
+        // font never point at an entry the client has not seen.
+        AddPageWarning(trailer, i,
+                       std::string("page skipped: ") + e.what());
+        if (new_fonts.fonts_size() > 0) {
+          counts[pdfv1::PDF_FAMILY_FONTS] +=
+              static_cast<uint64_t>(new_fonts.fonts_size());
+          pdfv1::ParseResponse fonts_msg;
+          *fonts_msg.mutable_fonts() = new_fonts;
+          client_ok = writer->Write(fonts_msg);
+        }
+        continue;
+      }
     }
 
     counts[pdfv1::PDF_FAMILY_PLACED_IMAGES] += chunk->images_size();
@@ -741,8 +966,6 @@ grpc::Status QparseServiceImpl::Parse(
   }
   if (!client_ok) return grpc::Status::OK;
 
-  pdfv1::ParseResponse trailer_msg;
-  auto* trailer = trailer_msg.mutable_trailer();
   for (const auto& [family, count] : counts) {
     auto* entry = trailer->add_counts();
     entry->set_family(family);
@@ -753,7 +976,7 @@ grpc::Status QparseServiceImpl::Parse(
 }
 
 grpc::Status QparseServiceImpl::Render(
-    grpc::ServerContext* /*context*/, const pdfv1::RenderRequest* request,
+    grpc::ServerContext* context, const pdfv1::RenderRequest* request,
     grpc::ServerWriter<pdfv1::RenderResponse>* writer) {
   if (request->dpi() <= 0.0) {
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
@@ -766,7 +989,7 @@ grpc::Status QparseServiceImpl::Render(
     case ResolveOutcome::kVerdict:
       break;
     case ResolveOutcome::kOk:
-      LoadDocument(request->document(), &loaded);
+      LoadDocument(request->document(), /*with_pages=*/true, &loaded);
       break;
   }
   if (loaded.status != pdfv1::LOAD_STATUS_OK) {
@@ -780,7 +1003,7 @@ grpc::Status QparseServiceImpl::Render(
     return grpc::Status::OK;
   }
 
-  int page_count = loaded.doc->get_number_of_pages();
+  int page_count = loaded.pages->page_count();
   int begin = 0;
   int end = page_count;
   if (request->has_pages()) {
@@ -790,20 +1013,25 @@ grpc::Status QparseServiceImpl::Render(
   }
 
   const float scale = static_cast<float>(request->dpi() / 72.0);
-  pdflib::decode_config config = MakeDecodeConfig();
-  config.extract_bitmap_pixels = true;
-  config.bitmap_target_pixels_per_unit = scale;
+  const pdflib::decode_config config = RenderDecodeConfig(scale);
   pdflib::render_config render_cfg;
   render_cfg.scale = scale;
 
   for (int i = begin; i < end; ++i) {
+    // A cancelled or expired call stops rendering at the next page.
+    if (context->IsCancelled()) {
+      return grpc::Status(grpc::StatusCode::CANCELLED,
+                          "the call was cancelled");
+    }
     std::shared_ptr<pdflib::pdf_decoder<pdflib::PAGE>> decoder;
     try {
-      decoder = loaded.doc->decode_page(i, config);
+      ++decoded_pages_;
+      decoder = loaded.pages->Decode(i, config);
     } catch (const std::exception&) {
       continue;
     }
-    if (decoder == nullptr) continue;
+    pdflib::size_instruction size = SizeInstruction(loaded.pages->geometry(i));
+    decoder->get_instructions().add_size_instruction(size);
     pdflib::renderer<pdflib::BLEND2D> rnd(render_cfg);
     decoder->get_instructions().iterate_over_instructions(rnd);
     auto canvas = rnd.get_canvas();

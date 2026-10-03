@@ -1,14 +1,19 @@
 // Contract test for grpc-qparse: start the engine-backed service in
 // process, dial it through the generated stubs, and walk the tier 0
 // families plus this backend's own strengths (reading-order cells, shapes,
-// embedded fonts) over the hello.pdf and rich.pdf fixtures.
+// embedded fonts) over the hello.pdf, rich.pdf and frames.pdf fixtures.
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
@@ -29,11 +34,223 @@ void Check(bool ok, const char* what) {
   }
 }
 
+void Check(bool ok, const std::string& what) { Check(ok, what.c_str()); }
+
 std::string ReadFile(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
   std::ostringstream buf;
   buf << in.rdbuf();
   return buf.str();
+}
+
+bool Near(double a, double b, double tolerance) {
+  return std::fabs(a - b) <= tolerance;
+}
+
+bool BoxNear(const pdfv1::BoundingBox& box, const std::array<double, 4>& want,
+             double tolerance) {
+  return Near(box.x0(), want[0], tolerance) &&
+         Near(box.y0(), want[1], tolerance) &&
+         Near(box.x1(), want[2], tolerance) &&
+         Near(box.y1(), want[3], tolerance);
+}
+
+// Writes numbered objects into a PDF with a classic cross-reference table.
+std::string AssemblePdf(const std::vector<std::string>& objects) {
+  std::string out = "%PDF-1.7\n";
+  std::vector<size_t> offsets;
+  for (size_t i = 0; i < objects.size(); ++i) {
+    offsets.push_back(out.size());
+    out += std::to_string(i + 1) + " 0 obj\n" + objects[i] + "\nendobj\n";
+  }
+  const size_t xref = out.size();
+  out += "xref\n0 " + std::to_string(objects.size() + 1) +
+         "\n0000000000 65535 f \n";
+  for (size_t offset : offsets) {
+    char line[32];
+    std::snprintf(line, sizeof(line), "%010zu 00000 n \n", offset);
+    out += line;
+  }
+  out += "trailer\n<< /Size " + std::to_string(objects.size() + 1) +
+         " /Root 1 0 R >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
+  return out;
+}
+
+std::string Stream(const std::string& data) {
+  return "<< /Length " + std::to_string(data.size()) + " >>\nstream\n" +
+         data + "\nendstream";
+}
+
+// A document of `pages` Letter pages that all draw one text-heavy content
+// stream: slow enough to decode that a cancelled call visibly stops early.
+std::string ManyPagePdf(int pages) {
+  std::string content;
+  for (int line = 0; line < 60; ++line) {
+    content += "BT /F1 9 Tf 72 " + std::to_string(760 - line * 12) +
+               " Td (The quick brown fox jumps over the lazy dog, line " +
+               std::to_string(line) + ") Tj ET\n";
+  }
+  std::string kids;
+  for (int i = 0; i < pages; ++i) kids += std::to_string(5 + i) + " 0 R ";
+  std::vector<std::string> objects = {
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Kids [" + kids + "] /Count " + std::to_string(pages) +
+          " /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> >>",
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+      Stream(content)};
+  for (int i = 0; i < pages; ++i) {
+    objects.push_back("<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>");
+  }
+  return AssemblePdf(objects);
+}
+
+std::unique_ptr<grpc::Server> StartServer(grpc::Service* service,
+                                          int* port) {
+  grpc::ServerBuilder builder;
+  builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(),
+                           port);
+  builder.RegisterService(service);
+  return builder.BuildAndStart();
+}
+
+std::unique_ptr<pdfv1::PdfBackendService::Stub> Dial(int port) {
+  return pdfv1::PdfBackendService::NewStub(
+      grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
+                          grpc::InsecureChannelCredentials()));
+}
+
+// Everything one Parse stream carried.
+struct ParseResult {
+  grpc::Status status;
+  pdfv1::ParseHeader header;
+  std::map<uint32_t, pdfv1::PageChunk> pages;
+  std::map<uint32_t, pdfv1::FontRef> fonts;
+  std::vector<pdfv1::EmbeddedFont> embedded;
+  std::optional<pdfv1::ParseTrailer> trailer;
+};
+
+ParseResult ParseDocument(pdfv1::PdfBackendService::Stub* stub,
+                          const std::string& pdf,
+                          const std::vector<pdfv1::PdfFamily>& families,
+                          std::optional<std::pair<uint32_t, uint32_t>> range) {
+  grpc::ClientContext ctx;
+  pdfv1::ParseRequest request;
+  request.mutable_document()->set_data(pdf);
+  for (pdfv1::PdfFamily family : families) request.add_families(family);
+  if (range.has_value()) {
+    request.mutable_pages()->set_begin(range->first);
+    request.mutable_pages()->set_end(range->second);
+  }
+  ParseResult result;
+  auto reader = stub->Parse(&ctx, request);
+  pdfv1::ParseResponse msg;
+  while (reader->Read(&msg)) {
+    if (msg.has_header()) {
+      result.header = msg.header();
+    } else if (msg.has_page()) {
+      result.pages[msg.page().page_index()].MergeFrom(msg.page());
+    } else if (msg.has_fonts()) {
+      for (const auto& font : msg.fonts().fonts()) {
+        result.fonts[font.font_id()] = font;
+      }
+    } else if (msg.has_embedded_font()) {
+      result.embedded.push_back(msg.embedded_font());
+    } else if (msg.has_trailer()) {
+      result.trailer = msg.trailer();
+    }
+  }
+  result.status = reader->Finish();
+  return result;
+}
+
+std::vector<pdfv1::PageRaster> RenderDocument(
+    pdfv1::PdfBackendService::Stub* stub, const std::string& pdf, double dpi,
+    pdfv1::PixelFormat format,
+    std::optional<std::pair<uint32_t, uint32_t>> range, grpc::Status* status) {
+  grpc::ClientContext ctx;
+  pdfv1::RenderRequest request;
+  request.mutable_document()->set_data(pdf);
+  request.set_dpi(dpi);
+  request.set_pixel_format(format);
+  if (range.has_value()) {
+    request.mutable_pages()->set_begin(range->first);
+    request.mutable_pages()->set_end(range->second);
+  }
+  std::vector<pdfv1::PageRaster> rasters;
+  auto reader = stub->Render(&ctx, request);
+  pdfv1::RenderResponse msg;
+  while (reader->Read(&msg)) {
+    if (msg.has_raster()) rasters.push_back(msg.raster());
+  }
+  *status = reader->Finish();
+  return rasters;
+}
+
+const pdfv1::TextCell* FindCell(const pdfv1::PageChunk& page,
+                                const std::string& text) {
+  for (const auto& cell : page.text_cells()) {
+    if (cell.text().find(text) != std::string::npos) return &cell;
+  }
+  return nullptr;
+}
+
+// The client's mapping (gRParse src/remote_page_source.cpp, PageFrame):
+// contract boxes are user space before /Rotate, and the rendered page is
+// the CropBox turned clockwise by /Rotate with a top-left origin. Returns
+// {left, top, right, bottom} in pixels at the given DPI.
+std::array<double, 4> ToDisplayPixels(const pdfv1::PageInfo& info,
+                                      const pdfv1::BoundingBox& box,
+                                      double dpi) {
+  const int rotation = ((info.rotation_degrees() % 360) + 360) % 360;
+  const double origin_x = info.crop_box().x0();
+  const double origin_y = info.crop_box().y0();
+  const double width = info.crop_box().x1() - info.crop_box().x0();
+  const double height = info.crop_box().y1() - info.crop_box().y0();
+  auto to_display = [&](double x, double y) -> std::array<double, 2> {
+    const double u = x - origin_x;
+    const double down = height - (y - origin_y);
+    switch (rotation) {
+      case 90:
+        return {height - down, u};
+      case 180:
+        return {width - u, height - down};
+      case 270:
+        return {down, width - u};
+      default:
+        return {u, down};
+    }
+  };
+  const auto a = to_display(box.x0(), box.y0());
+  const auto b = to_display(box.x1(), box.y1());
+  const double scale = dpi / 72.0;
+  return {std::min(a[0], b[0]) * scale, std::min(a[1], b[1]) * scale,
+          std::max(a[0], b[0]) * scale, std::max(a[1], b[1]) * scale};
+}
+
+// Counts the pixels of an RGBA8 raster that pass `match`, inside or
+// outside a pixel box.
+template <typename Match>
+std::pair<int, int> CountPixels(const pdfv1::PageRaster& raster,
+                                const std::array<double, 4>& box,
+                                Match match) {
+  int inside = 0;
+  int outside = 0;
+  const auto* pixels =
+      reinterpret_cast<const unsigned char*>(raster.pixels().data());
+  for (uint32_t y = 0; y < raster.height_px(); ++y) {
+    for (uint32_t x = 0; x < raster.width_px(); ++x) {
+      const unsigned char* p = pixels + y * raster.stride_bytes() + x * 4;
+      if (!match(p)) continue;
+      const bool in = x + 0.5 >= box[0] && x + 0.5 <= box[2] &&
+                      y + 0.5 >= box[1] && y + 0.5 <= box[3];
+      ++(in ? inside : outside);
+    }
+  }
+  return {inside, outside};
+}
+
+bool IsRed(const unsigned char* p) {
+  return p[0] > 200 && p[1] < 60 && p[2] < 60;
 }
 
 }  // namespace
@@ -464,6 +681,298 @@ int main(int argc, char** argv) {
             "most recent document survives eviction");
     }
     tiny_server->Shutdown();
+  }
+
+  // frames.pdf: the same content on eight differently framed pages. Every
+  // family comes out in unrotated user space, PageInfo carries the true
+  // (inherited) /Rotate and the stored boxes, and the raster is the CropBox
+  // turned by /Rotate, so the client's page mapping lands each box on its
+  // ink.
+  const std::string frames = ReadFile(fixture_dir + "/frames.pdf");
+  Check(!frames.empty(), "frames.pdf read");
+  struct FramedPage {
+    int rotation;
+    double width;
+    double height;
+    std::array<double, 4> media;
+    std::array<double, 4> crop;
+    // Where "Frame" starts, its baseline, and the red rectangle.
+    double text_x;
+    double baseline;
+    std::array<double, 4> red;
+  };
+  const std::array<double, 4> letter = {0, 0, 612, 792};
+  const std::array<double, 4> red = {300, 500, 360, 530};
+  const FramedPage framed[8] = {
+      {0, 612, 792, letter, letter, 72, 700, red},
+      {90, 792, 612, letter, letter, 72, 700, red},
+      {180, 612, 792, letter, letter, 72, 700, red},
+      {270, 792, 612, letter, letter, 72, 700, red},
+      {90, 792, 612, letter, letter, 72, 700, red},
+      {0, 540, 720, letter, {36, 36, 576, 756}, 72, 700, red},
+      {0, 612, 792, {100, 200, 712, 992}, {100, 200, 712, 992}, 172, 900,
+       {400, 700, 460, 730}},
+      {90, 672, 512, letter, {50, 60, 562, 732}, 72, 650,
+       {300, 400, 360, 430}},
+  };
+  {
+    ParseResult parsed = ParseDocument(stub.get(), frames, {}, std::nullopt);
+    Check(parsed.status.ok(), "frames Parse finished OK");
+    Check(parsed.header.pages_size() == 8, "frames inventory lists every page");
+    for (int i = 0; i < 8 && i < parsed.header.pages_size(); ++i) {
+      const std::string page = "frames page " + std::to_string(i) + ": ";
+      const auto& info = parsed.header.pages(i);
+      const FramedPage& want = framed[i];
+      Check(info.rotation_degrees() == want.rotation,
+            page + "rotation_degrees is the page's own or inherited /Rotate");
+      Check(Near(info.width_pts(), want.width, 0.01) &&
+                Near(info.height_pts(), want.height, 0.01),
+            page + "size is the CropBox after /Rotate");
+      Check(BoxNear(info.media_box(), want.media, 0.01),
+            page + "media_box as stored, unrotated");
+      Check(BoxNear(info.crop_box(), want.crop, 0.01),
+            page + "crop_box as stored, unrotated");
+
+      const auto it = parsed.pages.find(static_cast<uint32_t>(i));
+      if (it == parsed.pages.end()) {
+        Check(false, page + "page chunk streamed");
+        continue;
+      }
+      const pdfv1::TextCell* cell = FindCell(it->second, "Frame");
+      Check(cell != nullptr, page + "\"Frame\" cell present");
+      if (cell != nullptr) {
+        Check(Near(cell->bbox().x0(), want.text_x, 1.5),
+              page + "cell starts where the text is drawn");
+        Check(cell->bbox().y0() <= want.baseline + 0.5 &&
+                  cell->bbox().y0() >= want.baseline - 8,
+              page + "cell bottom at the baseline");
+        Check(cell->bbox().y1() >= want.baseline + 12 &&
+                  cell->bbox().y1() <= want.baseline + 25,
+              page + "cell top an em above the baseline");
+        Check(Near(cell->quad().x0(), cell->bbox().x0(), 1.5) &&
+                  Near(cell->quad().y0(), cell->bbox().y0(), 1.5),
+              page + "quad in the bbox's frame");
+      }
+      bool red_found = false;
+      for (const auto& shape : it->second.shapes()) {
+        if (BoxNear(shape.bbox(), want.red, 0.5)) red_found = true;
+      }
+      Check(red_found, page + "red rectangle where it is drawn");
+    }
+    // Pages 1 to 5 draw exactly what page 0 draws: rotating or cropping the
+    // page must not move a cell.
+    const pdfv1::TextCell* upright =
+        parsed.pages.count(0) ? FindCell(parsed.pages[0], "Frame") : nullptr;
+    for (uint32_t i = 1; i <= 5 && upright != nullptr; ++i) {
+      const pdfv1::TextCell* cell =
+          parsed.pages.count(i) ? FindCell(parsed.pages[i], "Frame") : nullptr;
+      Check(cell != nullptr &&
+                BoxNear(cell->bbox(),
+                        {upright->bbox().x0(), upright->bbox().y0(),
+                         upright->bbox().x1(), upright->bbox().y1()},
+                        0.01),
+            "frames page " + std::to_string(i) +
+                ": the cell sits exactly where the upright page has it");
+    }
+    // Links and widgets share the cells' frame, CropBox or not.
+    struct FramedLink {
+      uint32_t page;
+      std::string uri;
+      std::array<double, 4> rect;
+    };
+    for (const FramedLink& want :
+         {FramedLink{1, "https://example.com/rotated", {70, 695, 200, 725}},
+          FramedLink{5, "https://example.com/cropped", {70, 695, 200, 725}},
+          FramedLink{7, "https://example.com/both", {70, 645, 200, 675}}}) {
+      const std::string page = "frames page " + std::to_string(want.page) + ": ";
+      const pdfv1::PageChunk& chunk = parsed.pages[want.page];
+      Check(chunk.hyperlinks_size() == 1, page + "one link");
+      if (chunk.hyperlinks_size() != 1) continue;
+      const auto& link = chunk.hyperlinks(0);
+      Check(link.uri() == want.uri, page + "link target");
+      Check(BoxNear(link.bbox(), want.rect, 0.01),
+            page + "link rect as stored, corners normalized");
+      const pdfv1::TextCell* cell = FindCell(chunk, "Frame");
+      if (cell != nullptr) {
+        const double cx = (cell->bbox().x0() + cell->bbox().x1()) / 2;
+        const double cy = (cell->bbox().y0() + cell->bbox().y1()) / 2;
+        Check(cx > link.bbox().x0() && cx < link.bbox().x1() &&
+                  cy > link.bbox().y0() && cy < link.bbox().y1(),
+              page + "the link covers the text it was drawn over");
+      }
+    }
+    struct FramedField {
+      uint32_t page;
+      std::string name;
+      std::array<double, 4> rect;
+    };
+    for (const FramedField& want :
+         {FramedField{5, "cropped_field", {300, 300, 450, 320}},
+          FramedField{7, "rotated_field", {300, 250, 450, 270}}}) {
+      const pdfv1::PageChunk& chunk = parsed.pages[want.page];
+      const std::string page = "frames page " + std::to_string(want.page) + ": ";
+      Check(chunk.form_fields_size() == 1 &&
+                chunk.form_fields(0).name() == want.name &&
+                BoxNear(chunk.form_fields(0).rect(), want.rect, 0.01),
+            page + "widget rect as stored");
+    }
+    const pdfv1::TextCell* edge =
+        parsed.pages.count(5) ? FindCell(parsed.pages[5], "Edge") : nullptr;
+    Check(edge != nullptr && Near(edge->bbox().x0(), 20, 1.5),
+          "frames page 5: a cell straddling the CropBox edge is kept");
+    Check(parsed.pages[7].images_size() == 1 &&
+              BoxNear(parsed.pages[7].images(0).bbox(), {120, 200, 170, 230},
+                      0.5),
+          "frames page 7: image placed where its matrix puts it");
+  }
+  // Render agrees with Parse: the client maps each page's red rectangle
+  // through PageInfo onto the raster, and the red ink is there and nowhere
+  // else.
+  {
+    ParseResult parsed = ParseDocument(
+        stub.get(), frames, {pdfv1::PDF_FAMILY_PAGE_INVENTORY}, std::nullopt);
+    grpc::Status status;
+    std::vector<pdfv1::PageRaster> rasters = RenderDocument(
+        stub.get(), frames, 72.0, pdfv1::PIXEL_FORMAT_RGBA8, std::nullopt,
+        &status);
+    Check(status.ok() && rasters.size() == 8, "frames renders every page");
+    for (const auto& raster : rasters) {
+      const uint32_t i = raster.page_index();
+      if (i >= 8 || static_cast<int>(i) >= parsed.header.pages_size()) continue;
+      const std::string page = "frames raster " + std::to_string(i) + ": ";
+      const auto& info = parsed.header.pages(static_cast<int>(i));
+      Check(raster.width_px() ==
+                    static_cast<uint32_t>(std::ceil(info.width_pts())) &&
+                raster.height_px() ==
+                    static_cast<uint32_t>(std::ceil(info.height_pts())),
+            page + "raster is the displayed page");
+      pdfv1::BoundingBox box;
+      box.set_x0(framed[i].red[0]);
+      box.set_y0(framed[i].red[1]);
+      box.set_x1(framed[i].red[2]);
+      box.set_y1(framed[i].red[3]);
+      const auto px = ToDisplayPixels(info, box, 72.0);
+      const auto [inside, outside] = CountPixels(
+          raster, {px[0] - 2, px[1] - 2, px[2] + 2, px[3] + 2}, IsRed);
+      const double area = (px[2] - px[0]) * (px[3] - px[1]);
+      Check(inside >= 0.8 * area,
+            page + "red rectangle drawn where the client maps it");
+      Check(outside == 0, page + "no red ink anywhere else");
+    }
+  }
+
+  // A page range decodes only its pages, and document-level families decode
+  // none; the header still carries the whole inventory.
+  {
+    const uint64_t before = service.decoded_pages();
+    ParseResult ranged = ParseDocument(
+        stub.get(), frames, {pdfv1::PDF_FAMILY_TEXT_CELLS}, std::make_pair(2u, 3u));
+    Check(ranged.status.ok(), "ranged Parse finished OK");
+    Check(service.decoded_pages() - before == 1,
+          "a one-page range decodes one page");
+    Check(ranged.header.pages_size() == 8,
+          "a ranged header still lists every page");
+    Check(ranged.pages.size() == 1 && ranged.pages.count(2) == 1,
+          "only the requested page streams");
+    Check(ranged.trailer.has_value(), "ranged Parse reaches the trailer");
+
+    const uint64_t before_outline = service.decoded_pages();
+    ParseResult outline = ParseDocument(
+        stub.get(), frames, {pdfv1::PDF_FAMILY_OUTLINE}, std::nullopt);
+    Check(outline.status.ok(), "outline-only Parse finished OK");
+    Check(service.decoded_pages() == before_outline,
+          "document-level families decode no page");
+
+    const uint64_t before_render = service.decoded_pages();
+    grpc::Status status;
+    std::vector<pdfv1::PageRaster> one = RenderDocument(
+        stub.get(), frames, 36.0, pdfv1::PIXEL_FORMAT_RGBA8,
+        std::make_pair(6u, 7u), &status);
+    Check(status.ok() && one.size() == 1 && one[0].page_index() == 6,
+          "a one-page Render range renders that page");
+    Check(service.decoded_pages() - before_render == 1,
+          "a one-page Render range decodes one page");
+  }
+
+  // A page the engine cannot decode (an operator short of operands throws
+  // in the engine) still has its PageInfo, and the trailer says why its
+  // chunk is missing.
+  {
+    const std::string broken = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] "
+         "/Resources << /Font << /F1 7 0 R >> >> >>",
+         "<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>",
+         "<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Rotate 90 >>",
+         Stream("BT /F1 12 Tf 72 700 Td (Fine) Tj ET"),
+         Stream("0 0 rg 72 700 100 20 re f"),
+         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"});
+    ParseResult parsed = ParseDocument(stub.get(), broken, {}, std::nullopt);
+    Check(parsed.status.ok(), "Parse with an undecodable page finished OK");
+    Check(parsed.header.pages_size() == 2 &&
+              parsed.header.pages(1).rotation_degrees() == 90 &&
+              Near(parsed.header.pages(1).width_pts(), 792, 0.01),
+          "the undecodable page is still in the inventory");
+    Check(parsed.pages.count(0) == 1 &&
+              FindCell(parsed.pages[0], "Fine") != nullptr,
+          "the good page still streams");
+    Check(parsed.pages.count(1) == 0, "the undecodable page has no chunk");
+    bool warned = false;
+    if (parsed.trailer.has_value()) {
+      for (const auto& warning : parsed.trailer->warnings()) {
+        if (warning.has_page_index() && warning.page_index() == 1 &&
+            !warning.message().empty()) {
+          warned = true;
+        }
+      }
+    }
+    Check(warned, "the trailer names the skipped page");
+  }
+
+  // A cancelled call stops decoding: Parse sends its header before any page
+  // is decoded, and both RPCs check the call between pages.
+  {
+    const std::string many = ManyPagePdf(400);
+    for (bool render : {false, true}) {
+      grpc_qparse::QparseServiceImpl cancel_service(
+          grpc_qparse::DocumentCacheConfig{});
+      int cancel_port = 0;
+      std::unique_ptr<grpc::Server> cancel_server =
+          StartServer(&cancel_service, &cancel_port);
+      auto cancel_stub = Dial(cancel_port);
+      grpc::ClientContext ctx;
+      bool first = false;
+      if (render) {
+        pdfv1::RenderRequest request;
+        request.mutable_document()->set_data(many);
+        request.set_dpi(36.0);
+        auto reader = cancel_stub->Render(&ctx, request);
+        pdfv1::RenderResponse msg;
+        first = reader->Read(&msg) && msg.has_raster();
+        ctx.TryCancel();
+        while (reader->Read(&msg)) {
+        }
+        reader->Finish();
+      } else {
+        pdfv1::ParseRequest request;
+        request.mutable_document()->set_data(many);
+        request.add_families(pdfv1::PDF_FAMILY_TEXT_CELLS);
+        auto reader = cancel_stub->Parse(&ctx, request);
+        pdfv1::ParseResponse msg;
+        first = reader->Read(&msg) && msg.has_header();
+        ctx.TryCancel();
+        while (reader->Read(&msg)) {
+        }
+        reader->Finish();
+      }
+      // Shutdown waits for the handler to return.
+      cancel_server->Shutdown();
+      Check(first, render ? "cancelled Render sent its first raster"
+                          : "cancelled Parse sent its header");
+      Check(cancel_service.decoded_pages() < 200,
+            render ? "a cancelled Render stops decoding"
+                   : "a cancelled Parse stops decoding");
+    }
   }
 
   server->Shutdown();
