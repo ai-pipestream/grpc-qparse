@@ -2,7 +2,7 @@
 // process, dial it through the generated stubs, and walk the tier 0
 // families plus this backend's own strengths (reading-order cells, shapes,
 // embedded fonts) over the hello.pdf, rich.pdf, fonts.pdf, frames.pdf,
-// encrypted.pdf, bomb.pdf and lzw.pdf fixtures.
+// encrypted.pdf, bomb.pdf, lzw.pdf and annots.pdf fixtures.
 
 #include <algorithm>
 #include <array>
@@ -295,6 +295,139 @@ struct ErrorLog {
     });
   }
 };
+
+// Renders a request's one page and returns its raster, or nullopt when the
+// call fails or streams anything but exactly one raster.
+std::optional<pdfv1::PageRaster> RenderOne(
+    pdfv1::PdfBackendService::Stub* stub, const pdfv1::RenderRequest& request,
+    grpc::Status* status) {
+  grpc::ClientContext ctx;
+  auto reader = stub->Render(&ctx, request);
+  std::vector<pdfv1::PageRaster> rasters;
+  pdfv1::RenderResponse msg;
+  while (reader->Read(&msg)) {
+    if (msg.has_raster()) rasters.push_back(msg.raster());
+  }
+  *status = reader->Finish();
+  if (!status->ok() || rasters.size() != 1) return std::nullopt;
+  return rasters[0];
+}
+
+// The first three channels of the pixel at (x, y), top-left origin; all
+// three are the luma on a GRAY8 raster. {-1, -1, -1} when it is outside.
+std::array<int, 3> PixelAt(const pdfv1::PageRaster& raster, uint32_t x,
+                           uint32_t y) {
+  const uint32_t channels =
+      raster.width_px() == 0 ? 0 : raster.stride_bytes() / raster.width_px();
+  if (x >= raster.width_px() || y >= raster.height_px() || channels == 0) {
+    return {-1, -1, -1};
+  }
+  const auto* p = reinterpret_cast<const unsigned char*>(
+                      raster.pixels().data()) +
+                  static_cast<size_t>(y) * raster.stride_bytes() + x * channels;
+  if (channels == 1) return {p[0], p[0], p[0]};
+  return {p[0], p[1], p[2]};
+}
+
+bool ColorNear(const std::array<int, 3>& got, const std::array<int, 3>& want) {
+  for (size_t c = 0; c < 3; ++c) {
+    if (std::abs(got[c] - want[c]) > 3) return false;
+  }
+  return true;
+}
+
+// The pixels the Render options test reads on annots.pdf at 72 dpi, top-left
+// origin: the unpainted corner, the middle of the green annotation, and the
+// black square the content stream fills.
+constexpr std::array<uint32_t, 2> kCorner = {190, 10};
+constexpr std::array<uint32_t, 2> kAnnotation = {100, 100};
+constexpr std::array<uint32_t, 2> kContent = {20, 180};
+
+struct RenderOptionsCase {
+  const char* what;
+  pdfv1::PixelFormat format;
+  std::optional<std::array<double, 4>> background;
+  bool omit_annotations;
+  std::array<int, 3> corner;
+  std::array<int, 3> annotation;
+  std::array<int, 3> content;
+};
+
+// RenderRequest.background is laid under the page and omit_annotations
+// leaves the annotation appearances out, while the content stream draws
+// either way.
+void CheckRenderOptions(pdfv1::PdfBackendService::Stub* stub,
+                        const std::string& annots_pdf) {
+  const std::array<int, 3> white = {255, 255, 255};
+  const std::array<int, 3> black = {0, 0, 0};
+  const std::array<int, 3> green = {0, 255, 0};
+  const std::array<int, 3> blue = {0, 0, 255};
+  for (const RenderOptionsCase& c : {
+           RenderOptionsCase{"defaults", pdfv1::PIXEL_FORMAT_RGB8,
+                             std::nullopt, false, white, green, black},
+           RenderOptionsCase{"omit_annotations", pdfv1::PIXEL_FORMAT_RGB8,
+                             std::nullopt, true, white, white, black},
+           RenderOptionsCase{"opaque background", pdfv1::PIXEL_FORMAT_RGBA8,
+                             std::array<double, 4>{0, 0, 1, 1}, false, blue,
+                             green, black},
+           RenderOptionsCase{"background without annotations",
+                             pdfv1::PIXEL_FORMAT_RGB8,
+                             std::array<double, 4>{0, 0, 1, 1}, true, blue,
+                             blue, black},
+           RenderOptionsCase{"translucent background lands on white",
+                             pdfv1::PIXEL_FORMAT_RGB8,
+                             std::array<double, 4>{1, 0, 0, 0.5}, true,
+                             {255, 128, 128}, {255, 128, 128}, black},
+           RenderOptionsCase{"out of range components are clamped",
+                             pdfv1::PIXEL_FORMAT_RGB8,
+                             std::array<double, 4>{-1, 2, -1, 7}, true, green,
+                             green, black},
+           RenderOptionsCase{"gray background", pdfv1::PIXEL_FORMAT_GRAY8,
+                             std::array<double, 4>{0, 0, 0, 1}, true, black,
+                             black, black},
+       }) {
+    const std::string what = std::string("Render options, ") + c.what + ": ";
+    pdfv1::RenderRequest request;
+    request.mutable_document()->set_data(annots_pdf);
+    request.set_dpi(72.0);
+    request.set_pixel_format(c.format);
+    request.set_omit_annotations(c.omit_annotations);
+    if (c.background.has_value()) {
+      auto* color = request.mutable_background();
+      color->set_red((*c.background)[0]);
+      color->set_green((*c.background)[1]);
+      color->set_blue((*c.background)[2]);
+      color->set_alpha((*c.background)[3]);
+    }
+    grpc::Status status;
+    const std::optional<pdfv1::PageRaster> raster =
+        RenderOne(stub, request, &status);
+    Check(raster.has_value(), what + "one raster");
+    if (!raster.has_value()) continue;
+    Check(ColorNear(PixelAt(*raster, kCorner[0], kCorner[1]), c.corner),
+          what + "the unpainted corner shows the background");
+    Check(ColorNear(PixelAt(*raster, kAnnotation[0], kAnnotation[1]),
+                    c.annotation),
+          what + "the annotation is drawn or left out as asked");
+    Check(ColorNear(PixelAt(*raster, kContent[0], kContent[1]), c.content),
+          what + "the content stream still draws");
+  }
+}
+
+// A background component that is not a finite number is refused before
+// the document is read.
+void CheckNonFiniteBackground(pdfv1::PdfBackendService::Stub* stub,
+                              const std::string& annots_pdf) {
+  pdfv1::RenderRequest request;
+  request.mutable_document()->set_data(annots_pdf);
+  request.set_dpi(72.0);
+  request.mutable_background()->set_red(std::nan(""));
+  request.mutable_background()->set_alpha(1.0);
+  grpc::Status status;
+  RenderOne(stub, request, &status);
+  Check(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+        "Render options: a NaN background is INVALID_ARGUMENT");
+}
 
 }  // namespace
 
@@ -724,6 +857,10 @@ int main(int argc, char** argv) {
       Check(outside == 0, "no ink outside the text cell");
     }
   }
+
+  const std::string annots_pdf = ReadFile(fixture_dir + "/annots.pdf");
+  CheckRenderOptions(stub.get(), annots_pdf);
+  CheckNonFiniteBackground(stub.get(), annots_pdf);
 
   // Render load failures are typed in a one-message head stream, never a
   // bare gRPC error.

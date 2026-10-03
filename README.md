@@ -152,6 +152,17 @@ rule for it; anything else fails `Parse` and `Render` with
 an `end` past the document stops at its last page, and a range that starts
 past it selects no page, however large its `begin`.
 
+## Render options
+
+`Render` honors the request's `background` and `omit_annotations`. The
+background is painted under every page item; each component is clamped to
+[0, 1], and one that is not a finite number is `INVALID_ARGUMENT`. Unset,
+the page sits on opaque white. Rasters carry no transparency, so a
+background with alpha below 1 is laid over that white. With
+`omit_annotations` set, the page's annotations (markup and form widgets
+alike) are left out of the raster and only the content stream is drawn;
+`Parse` is unaffected.
+
 ## Render bounds
 
 `Render` takes a positive finite `dpi`; anything else (zero, negative,

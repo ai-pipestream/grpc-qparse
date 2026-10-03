@@ -324,6 +324,11 @@ std::vector<std::string> DropOversizedImages(QPDFObjectHandle resources,
   return dropped;
 }
 
+// Whether a page decode keeps the annotation appearances the engine draws
+// after the content stream. Render drops them when the request sets
+// omit_annotations; Parse always keeps them.
+enum class AnnotationAppearances { kDraw, kOmit };
+
 // The document's pages for Parse and Render, on a qpdf handle of the
 // call's own beside the engine's document decoder. The inventory comes
 // from the page dictionaries without decoding any content; a page's
@@ -388,14 +393,24 @@ class DocumentPages {
   //
   // When the call decodes image samples, max_image_pixels bounds every image
   // the page reaches (DropOversizedImages); each image left out is logged.
+  // With AnnotationAppearances::kOmit the page's annotation array is taken
+  // off before the decode, so no annotation appearance (markup, widget or
+  // otherwise) reaches the instruction list.
   std::shared_ptr<pdflib::pdf_decoder<pdflib::PAGE>> Decode(
       int index, const pdflib::decode_config& config,
-      std::optional<uint64_t> max_image_pixels = std::nullopt) {
+      std::optional<uint64_t> max_image_pixels = std::nullopt,
+      AnnotationAppearances annotations = AnnotationAppearances::kDraw) {
     QPDFObjectHandle page = pages_.at(static_cast<size_t>(index));
     const PageGeometry& page_geometry = geometry(index);
     page.replaceKey("/MediaBox", BoxArray(page_geometry.media_box));
     page.replaceKey("/CropBox", BoxArray(page_geometry.crop_box));
     page.replaceKey("/Rotate", QPDFObjectHandle::newInteger(0));
+    if (annotations == AnnotationAppearances::kOmit) {
+      // The engine reads both the standard /Annots and the misspelled
+      // /Annot some producers write.
+      page.removeKey("/Annots");
+      page.removeKey("/Annot");
+    }
     // The engine also looks for /Resources on the page and its direct
     // parent only; resources inherited from further up are pinned on the
     // page.
@@ -1196,6 +1211,88 @@ void ReleasePooledCanvas() {
   release.set_size(size);
 }
 
+// The request's background components, each a finite number; NaN or an
+// infinity cannot be laid down as a color.
+grpc::Status CheckBackground(const pdfv1::RenderRequest& request) {
+  if (!request.has_background()) return grpc::Status::OK;
+  const pdfv1::Color& c = request.background();
+  for (double v : {c.red(), c.green(), c.blue(), c.alpha()}) {
+    if (!std::isfinite(v)) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "background components must be finite numbers");
+    }
+  }
+  return grpc::Status::OK;
+}
+
+// The request's background as a fill the rasterizer paints before any page
+// item: the page's CropBox, a point wider on every side so no edge pixel is
+// left partly covered. Components are clamped to [0, 1]. The canvas starts
+// opaque white (blend2d_renderer.h set_size) and the raster carries no
+// transparency, so a background with alpha below 1 lands on that white,
+// the way a translucent page shows on a white sheet. nullopt when the
+// request sets none, which keeps the plain white canvas.
+std::optional<pdflib::shape_instruction> BackgroundFill(
+    const pdfv1::RenderRequest& request, const PageGeometry& geometry) {
+  if (!request.has_background()) return std::nullopt;
+  const pdfv1::Color& c = request.background();
+  auto to_byte = [](double v) {
+    return static_cast<int>(std::lround(std::clamp(v, 0.0, 1.0) * 255.0));
+  };
+  const std::array<int, 3> rgb = {to_byte(c.red()), to_byte(c.green()),
+                                  to_byte(c.blue())};
+  const double x0 = geometry.crop_box[0] - 1.0;
+  const double y0 = geometry.crop_box[1] - 1.0;
+  const double x1 = geometry.crop_box[2] + 1.0;
+  const double y1 = geometry.crop_box[3] + 1.0;
+  std::vector<pdflib::shape_subpath> rect;
+  rect.emplace_back(
+      x0, y0,
+      std::vector<pdflib::shape_segment_op>(3, pdflib::SEGMENT_LINE_TO),
+      std::vector<double>{x1, x1, x0}, std::vector<double>{y0, y1, y1},
+      pdflib::CLOSED, pdflib::RECTANGLE);
+  return pdflib::shape_instruction(
+      std::move(rect), pdflib::SHAPE_PAINT_FILL, pdflib::SHAPE_FILL_NONZERO,
+      /*line_width=*/0.0, /*line_cap=*/0, /*line_join=*/0,
+      /*miter_limit=*/10.0, /*dash_array=*/{}, /*dash_phase=*/0.0, rgb, rgb,
+      /*stroke_alpha=*/1.0, std::clamp(c.alpha(), 0.0, 1.0));
+}
+
+// Hands the page's instructions to the rasterizer, painting the background
+// fill, when there is one, right after the canvas is sized and so beneath
+// every page item. Duck-typed against
+// pdf_render_instructions::iterate_over_instructions.
+class BackgroundPainter {
+ public:
+  BackgroundPainter(pdflib::renderer<pdflib::BLEND2D>& renderer,
+                    std::optional<pdflib::shape_instruction> background)
+      : renderer_(renderer), background_(std::move(background)) {}
+
+  void set_size(pdflib::size_instruction& instr) {
+    renderer_.set_size(instr);
+    if (background_.has_value()) renderer_.render_shape(*background_);
+  }
+  void render_text(pdflib::text_instruction& instr) {
+    renderer_.render_text(instr);
+  }
+  void render_widget(pdflib::text_widget_instruction& instr) {
+    renderer_.render_widget(instr);
+  }
+  void render_bitmap(pdflib::bitmap_instruction& instr) {
+    renderer_.render_bitmap(instr);
+  }
+  void render_shape(pdflib::shape_instruction& instr) {
+    renderer_.render_shape(instr);
+  }
+  void render_shading(pdflib::shading_instruction& instr) {
+    renderer_.render_shading(instr);
+  }
+
+ private:
+  pdflib::renderer<pdflib::BLEND2D>& renderer_;
+  std::optional<pdflib::shape_instruction> background_;
+};
+
 // The page-level families, the ones that need a page decoded.
 bool WantPageItems(const pdfv1::ParseRequest& request) {
   for (pdfv1::PdfFamily family :
@@ -1237,6 +1334,66 @@ PageSpan SelectPages(bool has_range, const pdfv1::PageRange& range,
   const uint32_t begin = std::min(range.begin(), count);
   const uint32_t end = std::max(begin, std::min(range.end(), count));
   return {static_cast<int>(begin), static_cast<int>(end)};
+}
+
+// Fails the call with RESOURCE_EXHAUSTED when any page of the span would
+// need a raster wider or taller than Blend2D allows or with more pixels
+// than the budget.
+grpc::Status CheckRasterSizes(const DocumentPages& pages, PageSpan span,
+                              double dpi, float scale, uint64_t max_pixels) {
+  for (int i = span.begin; i < span.end; ++i) {
+    const std::array<double, 2> size = RasterSize(pages.geometry(i), scale);
+    if (size[0] > kMaxRasterSide || size[1] > kMaxRasterSide ||
+        size[0] * size[1] > static_cast<double>(max_pixels)) {
+      char detail[256];
+      std::snprintf(detail, sizeof(detail),
+                    "page %d at %g dpi needs a %.0fx%.0f pixel raster; the "
+                    "limit is %llu pixels and %.0f per side",
+                    i, dpi, size[0], size[1],
+                    static_cast<unsigned long long>(max_pixels),
+                    kMaxRasterSide);
+      return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, detail);
+    }
+  }
+  return grpc::Status::OK;
+}
+
+// Rasterizes one decoded page into msg's raster, over the request's
+// background. A page the rasterizer throws on, or that leaves no canvas of
+// its size, is logged and reported false, so the call skips it the way it
+// skips a page the engine cannot decode; the rest of the range still
+// renders.
+bool RasterizePage(pdflib::pdf_decoder<pdflib::PAGE>& decoder, int index,
+                   const PageGeometry& geometry,
+                   const pdflib::render_config& render_cfg,
+                   const pdfv1::RenderRequest& request,
+                   pdfv1::RenderResponse* msg) {
+  pdflib::size_instruction size = SizeInstruction(geometry);
+  decoder.get_instructions().add_size_instruction(size);
+  try {
+    pdflib::renderer<pdflib::BLEND2D> rnd(render_cfg);
+    BackgroundPainter painter(rnd, BackgroundFill(request, geometry));
+    decoder.get_instructions().iterate_over_instructions(painter);
+    auto canvas = rnd.get_canvas();
+    const auto& shape = rnd.get_shape();
+    const auto height = static_cast<uint32_t>(shape[0]);
+    const auto width = static_cast<uint32_t>(shape[1]);
+    if (canvas == nullptr || canvas->empty() ||
+        canvas->size() != static_cast<size_t>(width) * height * 4) {
+      LOG_S(ERROR) << "Render skips page " << index
+                   << ": the rasterizer produced no canvas of its size";
+      return false;
+    }
+    auto* raster = msg->mutable_raster();
+    raster->set_page_index(static_cast<uint32_t>(index));
+    raster->set_dpi(request.dpi());
+    FillPixels(*canvas, width, height, request.pixel_format(), raster);
+    return true;
+  } catch (const std::exception& e) {
+    LOG_S(ERROR) << "Render skips page " << index
+                 << ": the rasterizer failed on it: " << e.what();
+    return false;
+  }
 }
 
 void AddPageWarning(pdfv1::ParseTrailer* trailer, int page_index,
@@ -1530,6 +1687,9 @@ grpc::Status QparseServiceImpl::Render(
       return range;
     }
   }
+  if (grpc::Status background = CheckBackground(*request); !background.ok()) {
+    return background;
+  }
   CallSlots::Slot slot;
   if (grpc::Status admitted = slots_.Acquire(context, &slot); !admitted.ok()) {
     return admitted;
@@ -1560,25 +1720,18 @@ grpc::Status QparseServiceImpl::Render(
 
   // Every page is sized before any is rendered, so a page over the budget
   // fails the call before a raster streams or a canvas is allocated.
-  for (int i = span.begin; i < span.end; ++i) {
-    const std::array<double, 2> size =
-        RasterSize(loaded.pages->geometry(i), scale);
-    if (size[0] > kMaxRasterSide || size[1] > kMaxRasterSide ||
-        size[0] * size[1] > static_cast<double>(render_limits_.max_pixels)) {
-      char detail[256];
-      std::snprintf(detail, sizeof(detail),
-                    "page %d at %g dpi needs a %.0fx%.0f pixel raster; the "
-                    "limit is %llu pixels and %.0f per side",
-                    i, dpi, size[0], size[1],
-                    static_cast<unsigned long long>(render_limits_.max_pixels),
-                    kMaxRasterSide);
-      return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, detail);
-    }
+  if (grpc::Status sized = CheckRasterSizes(*loaded.pages, span, dpi, scale,
+                                            render_limits_.max_pixels);
+      !sized.ok()) {
+    return sized;
   }
 
   const pdflib::decode_config config = RenderDecodeConfig(scale);
   pdflib::render_config render_cfg;
   render_cfg.scale = scale;
+  const AnnotationAppearances annotations =
+      request->omit_annotations() ? AnnotationAppearances::kOmit
+                                  : AnnotationAppearances::kDraw;
 
   for (int i = span.begin; i < span.end; ++i) {
     // A cancelled or expired call stops rendering at the next page.
@@ -1591,42 +1744,18 @@ grpc::Status QparseServiceImpl::Render(
     std::shared_ptr<pdflib::pdf_decoder<pdflib::PAGE>> decoder;
     try {
       ++decoded_pages_;
-      decoder = loaded.pages->Decode(i, config, render_limits_.max_pixels);
+      decoder = loaded.pages->Decode(i, config, render_limits_.max_pixels,
+                                     annotations);
     } catch (const std::exception& e) {
       LOG_S(ERROR) << "Render skips page " << i
                    << ": the engine could not decode it: " << e.what();
       continue;
     }
-    pdflib::size_instruction size = SizeInstruction(loaded.pages->geometry(i));
-    decoder->get_instructions().add_size_instruction(size);
+    const PageGeometry& geometry = loaded.pages->geometry(i);
     pdfv1::RenderResponse msg;
-    bool rendered = false;
-    // A page the rasterizer throws on is skipped, the way a page the engine
-    // cannot decode is; the rest of the range still renders.
-    try {
-      pdflib::renderer<pdflib::BLEND2D> rnd(render_cfg);
-      decoder->get_instructions().iterate_over_instructions(rnd);
-      auto canvas = rnd.get_canvas();
-      const auto& shape = rnd.get_shape();
-      const auto height = static_cast<uint32_t>(shape[0]);
-      const auto width = static_cast<uint32_t>(shape[1]);
-      if (canvas != nullptr && !canvas->empty() &&
-          canvas->size() == static_cast<size_t>(width) * height * 4) {
-        auto* raster = msg.mutable_raster();
-        raster->set_page_index(static_cast<uint32_t>(i));
-        raster->set_dpi(dpi);
-        FillPixels(*canvas, width, height, request->pixel_format(), raster);
-        rendered = true;
-      } else {
-        LOG_S(ERROR) << "Render skips page " << i
-                     << ": the rasterizer produced no canvas of its size";
-      }
-    } catch (const std::exception& e) {
-      LOG_S(ERROR) << "Render skips page " << i
-                   << ": the rasterizer failed on it: " << e.what();
-    }
-    const std::array<double, 2> raster_size =
-        RasterSize(loaded.pages->geometry(i), scale);
+    const bool rendered =
+        RasterizePage(*decoder, i, geometry, render_cfg, *request, &msg);
+    const std::array<double, 2> raster_size = RasterSize(geometry, scale);
     if (raster_size[0] * raster_size[1] > kPooledCanvasPixels) {
       ReleasePooledCanvas();
     }
