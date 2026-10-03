@@ -7,6 +7,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -567,6 +568,60 @@ int main(int argc, char** argv) {
     Check(grpc_qparse::RenderLimits{}.max_pixels ==
               grpc_qparse::kMaxRenderPixels,
           "the default budget is the most one message carries");
+  }
+
+  // Render produces the requested pixel layout: frames.pdf page 0 at 72 dpi
+  // has its red rectangle around pixel (330, 277).
+  {
+    const std::string frames_pdf = ReadFile(fixture_dir + "/frames.pdf");
+    struct Layout {
+      pdfv1::PixelFormat requested;
+      pdfv1::PixelFormat produced;
+      uint32_t channels;
+      std::vector<int> red;
+    };
+    for (const Layout& want :
+         {Layout{pdfv1::PIXEL_FORMAT_RGBA8, pdfv1::PIXEL_FORMAT_RGBA8, 4,
+                 {255, 0, 0, 255}},
+          Layout{pdfv1::PIXEL_FORMAT_UNSPECIFIED, pdfv1::PIXEL_FORMAT_RGBA8, 4,
+                 {255, 0, 0, 255}},
+          Layout{pdfv1::PIXEL_FORMAT_BGRA8, pdfv1::PIXEL_FORMAT_BGRA8, 4,
+                 {0, 0, 255, 255}},
+          Layout{pdfv1::PIXEL_FORMAT_RGB8, pdfv1::PIXEL_FORMAT_RGB8, 3,
+                 {255, 0, 0}},
+          Layout{pdfv1::PIXEL_FORMAT_BGR8, pdfv1::PIXEL_FORMAT_BGR8, 3,
+                 {0, 0, 255}},
+          Layout{pdfv1::PIXEL_FORMAT_GRAY8, pdfv1::PIXEL_FORMAT_GRAY8, 1,
+                 {76}}}) {
+      const std::string name =
+          std::string(pdfv1::PixelFormat_Name(want.requested)) + ": ";
+      grpc::Status status;
+      std::vector<pdfv1::PageRaster> rasters =
+          RenderDocument(stub.get(), frames_pdf, 72.0, want.requested,
+                         std::make_pair(0u, 1u), &status);
+      Check(status.ok() && rasters.size() == 1, name + "one raster");
+      if (rasters.size() != 1) continue;
+      const pdfv1::PageRaster& raster = rasters[0];
+      Check(raster.pixel_format() == want.produced,
+            name + "the layout produced is reported");
+      Check(raster.stride_bytes() == raster.width_px() * want.channels &&
+                raster.pixels().size() ==
+                    static_cast<size_t>(raster.stride_bytes()) *
+                        raster.height_px(),
+            name + "stride and payload follow the layout");
+      if (raster.pixels().size() <
+          static_cast<size_t>(raster.stride_bytes()) * 278) {
+        continue;
+      }
+      const auto* pixel = reinterpret_cast<const unsigned char*>(
+                              raster.pixels().data()) +
+                          277 * raster.stride_bytes() + 330 * want.channels;
+      bool matches = true;
+      for (uint32_t c = 0; c < want.channels; ++c) {
+        if (std::abs(pixel[c] - want.red[c]) > 2) matches = false;
+      }
+      Check(matches, name + "the red rectangle comes out red");
+    }
   }
 
   // Content-addressed handshake (PdfDocument.sha256).

@@ -771,6 +771,74 @@ std::array<double, 2> RasterSize(const PageGeometry& geometry, float scale) {
           std::max(1.0, std::ceil(geometry.DisplayHeight() * scale - 1e-6))};
 }
 
+// Writes the rasterizer's RGBA canvas (rows top-down, width * height * 4
+// bytes) into the raster in the layout the caller asked for; RGBA8 when it
+// named none. The canvas starts opaque white (blend2d_renderer.h set_size)
+// and is only ever painted over, so dropping alpha loses nothing.
+void FillPixels(const std::vector<uint8_t>& rgba, uint32_t width,
+                uint32_t height, pdfv1::PixelFormat requested,
+                pdfv1::PageRaster* raster) {
+  pdfv1::PixelFormat format = requested;
+  uint32_t channels = 4;
+  switch (requested) {
+    case pdfv1::PIXEL_FORMAT_RGB8:
+    case pdfv1::PIXEL_FORMAT_BGR8:
+      channels = 3;
+      break;
+    case pdfv1::PIXEL_FORMAT_GRAY8:
+      channels = 1;
+      break;
+    case pdfv1::PIXEL_FORMAT_BGRA8:
+      break;
+    default:
+      format = pdfv1::PIXEL_FORMAT_RGBA8;
+      break;
+  }
+  raster->set_width_px(width);
+  raster->set_height_px(height);
+  raster->set_stride_bytes(width * channels);
+  raster->set_pixel_format(format);
+  if (format == pdfv1::PIXEL_FORMAT_RGBA8) {
+    raster->set_pixels(rgba.data(), rgba.size());
+    return;
+  }
+  const size_t pixels = static_cast<size_t>(width) * height;
+  std::string* out = raster->mutable_pixels();
+  out->resize(pixels * channels);
+  const uint8_t* src = rgba.data();
+  auto* dst = reinterpret_cast<uint8_t*>(out->data());
+  switch (format) {
+    case pdfv1::PIXEL_FORMAT_RGB8:
+      for (size_t i = 0; i < pixels; ++i, src += 4, dst += 3) {
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+      }
+      break;
+    case pdfv1::PIXEL_FORMAT_BGR8:
+      for (size_t i = 0; i < pixels; ++i, src += 4, dst += 3) {
+        dst[0] = src[2];
+        dst[1] = src[1];
+        dst[2] = src[0];
+      }
+      break;
+    case pdfv1::PIXEL_FORMAT_BGRA8:
+      for (size_t i = 0; i < pixels; ++i, src += 4, dst += 4) {
+        dst[0] = src[2];
+        dst[1] = src[1];
+        dst[2] = src[0];
+        dst[3] = src[3];
+      }
+      break;
+    default:  // GRAY8: Rec. 601 luma.
+      for (size_t i = 0; i < pixels; ++i, src += 4, ++dst) {
+        *dst = static_cast<uint8_t>(
+            (299u * src[0] + 587u * src[1] + 114u * src[2] + 500u) / 1000u);
+      }
+      break;
+  }
+}
+
 // Leaves a one-pixel canvas in this thread's pool in place of the last
 // one: a renderer hands its canvas to the pool when it is destroyed.
 void ReleasePooledCanvas() {
@@ -1106,15 +1174,14 @@ grpc::Status QparseServiceImpl::Render(
       decoder->get_instructions().iterate_over_instructions(rnd);
       auto canvas = rnd.get_canvas();
       const auto& shape = rnd.get_shape();
-      if (canvas != nullptr && !canvas->empty()) {
+      const auto height = static_cast<uint32_t>(shape[0]);
+      const auto width = static_cast<uint32_t>(shape[1]);
+      if (canvas != nullptr && !canvas->empty() &&
+          canvas->size() == static_cast<size_t>(width) * height * 4) {
         auto* raster = msg.mutable_raster();
         raster->set_page_index(static_cast<uint32_t>(i));
-        raster->set_height_px(static_cast<uint32_t>(shape[0]));
-        raster->set_width_px(static_cast<uint32_t>(shape[1]));
-        raster->set_stride_bytes(static_cast<uint32_t>(shape[1] * 4));
-        raster->set_pixel_format(pdfv1::PIXEL_FORMAT_RGBA8);
         raster->set_dpi(dpi);
-        raster->set_pixels(canvas->data(), canvas->size());
+        FillPixels(*canvas, width, height, request->pixel_format(), raster);
         rendered = true;
       }
     } catch (const std::exception&) {

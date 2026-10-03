@@ -9,7 +9,8 @@ build pins). The wrapper is Apache-2.0; the engine and its dependency set
 What this backend is for: reading-order text cells (its sanitizers merge
 raw chars into model-ready cells with direction, space width and rendering
 mode), vector shapes, embedded font programs, plus the tier 0 floor: typed
-load status, page inventory, and blend2d page rasters (RGBA8). Placed
+load status, page inventory, and blend2d page rasters (RGBA8, BGRA8, RGB8,
+BGR8 or GRAY8, as requested). Placed
 images, hyperlinks, form-field widgets, the outline, and the XMP packet
 ride along. Families the engine's public surface does not expose
 (annotations as typed data, encryption details, attachments, signatures,
