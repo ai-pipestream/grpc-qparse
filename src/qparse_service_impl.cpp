@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <optional>
@@ -350,9 +351,33 @@ bool WantFamily(const pdfv1::ParseRequest& request, pdfv1::PdfFamily family) {
                    family) != request.families().end();
 }
 
+// The engine's page JSON is read defensively: a field of an unexpected type
+// reads as absent instead of throwing, and a table row is checked before it
+// is indexed, so a schema change in the engine skips data rather than
+// aborting the stream or reading out of bounds.
+
 double NumberOr(const nlohmann::json& j, const char* key, double fallback) {
   auto it = j.find(key);
   return it != j.end() && it->is_number() ? it->get<double>() : fallback;
+}
+
+std::string StringOr(const nlohmann::json& j, const char* key) {
+  auto it = j.find(key);
+  return it != j.end() && it->is_string() ? it->get<std::string>()
+                                          : std::string();
+}
+
+// A count the contract stores as uint32, when the value is one.
+std::optional<uint32_t> UInt32Of(const nlohmann::json& value) {
+  if (!value.is_number_integer()) return std::nullopt;
+  if (value.is_number_unsigned()) {
+    const auto v = value.get<uint64_t>();
+    if (v > UINT32_MAX) return std::nullopt;
+    return static_cast<uint32_t>(v);
+  }
+  const auto v = value.get<int64_t>();
+  if (v < 0 || v > static_cast<int64_t>(UINT32_MAX)) return std::nullopt;
+  return static_cast<uint32_t>(v);
 }
 
 // Sets an axis-aligned box from two corners in either order; annotation
@@ -389,12 +414,28 @@ struct UserSpaceOffset {
   double dy = 0.0;
 };
 
-// Column indices resolved from a header+data table once per table.
+// Column indices resolved from a header+data table once per table; -1 when
+// the table has no such column.
 int ColumnIndex(const nlohmann::json& header, const std::string& name) {
+  if (!header.is_array()) return -1;
   for (size_t i = 0; i < header.size(); ++i) {
-    if (header[i].get<std::string>() == name) return static_cast<int>(i);
+    if (header[i].is_string() &&
+        header[i].get_ref<const std::string&>() == name) {
+      return static_cast<int>(i);
+    }
   }
   return -1;
+}
+
+// Whether a table row has the header's width and numbers in the columns
+// the caller is about to read.
+bool RowHasNumbers(const nlohmann::json& row, size_t width,
+                   std::initializer_list<int> columns) {
+  if (!row.is_array() || row.size() != width) return false;
+  for (int column : columns) {
+    if (!row[static_cast<size_t>(column)].is_number()) return false;
+  }
+  return true;
 }
 
 using FontProgram = std::shared_ptr<const pdflib::embedded_font_blob>;
@@ -469,6 +510,7 @@ void FillTextCells(const nlohmann::json& cells, const UserSpaceOffset& offset,
                    uint64_t* cell_count) {
   if (!cells.contains("header") || !cells.contains("data")) return;
   const auto& header = cells["header"];
+  const auto& data = cells["data"];
   const int ix0 = ColumnIndex(header, "x0");
   const int iy0 = ColumnIndex(header, "y0");
   const int ix1 = ColumnIndex(header, "x1");
@@ -481,8 +523,19 @@ void FillTextCells(const nlohmann::json& cells, const UserSpaceOffset& offset,
   const int ifontkey = ColumnIndex(header, "font-key");
   const int iltr = ColumnIndex(header, "left_to_right");
   const int iwidget = ColumnIndex(header, "widget");
-  for (const auto& row : cells["data"]) {
-    if (itext < 0 || !row[itext].is_string()) continue;
+  // A table without its geometry or text columns is not one this can read.
+  if (!data.is_array() || ix0 < 0 || iy0 < 0 || ix1 < 0 || iy1 < 0 ||
+      irx0 < 0 || itext < 0 ||
+      static_cast<size_t>(irx0) + 8 > header.size()) {
+    return;
+  }
+  for (const auto& row : data) {
+    if (!RowHasNumbers(row, header.size(),
+                       {ix0, iy0, ix1, iy1, irx0, irx0 + 1, irx0 + 2,
+                        irx0 + 3, irx0 + 4, irx0 + 5, irx0 + 6, irx0 + 7}) ||
+        !row[itext].is_string()) {
+      continue;
+    }
     // Widget cells re-enter through the form-field family.
     if (iwidget >= 0 && row[iwidget].is_boolean() && row[iwidget].get<bool>()) {
       continue;
@@ -511,8 +564,8 @@ void FillTextCells(const nlohmann::json& cells, const UserSpaceOffset& offset,
     if (ispace >= 0 && row[ispace].is_number()) {
       cell->set_space_width(row[ispace].get<double>());
     }
-    if (imode >= 0 && row[imode].is_number()) {
-      int mode = row[imode].get<int>();
+    if (imode >= 0 && row[imode].is_number_integer()) {
+      const auto mode = row[imode].get<int64_t>();
       if (mode >= 0 && mode <= 7) {
         cell->set_rendering_mode(
             static_cast<pdfv1::TextRenderingMode>(mode + 1));
@@ -537,7 +590,15 @@ void FillShapes(const nlohmann::json& shapes, const UserSpaceOffset& offset,
     if (!s.contains("x") || !s.contains("y")) continue;
     const auto& xs = s["x"];
     const auto& ys = s["y"];
-    if (!xs.is_array() || xs.size() != ys.size() || xs.empty()) continue;
+    if (!xs.is_array() || !ys.is_array() || xs.size() != ys.size() ||
+        xs.empty()) {
+      continue;
+    }
+    bool numeric = true;
+    for (size_t i = 0; i < xs.size(); ++i) {
+      numeric = numeric && xs[i].is_number() && ys[i].is_number();
+    }
+    if (!numeric) continue;
     auto* shape = chunk->add_shapes();
     double min_x = xs[0].get<double>() + offset.dx;
     double min_y = ys[0].get<double>() + offset.dy;
@@ -570,7 +631,10 @@ void FillShapes(const nlohmann::json& shapes, const UserSpaceOffset& offset,
       shape->set_line_width(s["line-width"].get<double>());
     }
     auto fill_color = [](const nlohmann::json& rgb, pdfv1::Color* color) {
-      if (!rgb.is_array() || rgb.size() != 3) return;
+      if (!rgb.is_array() || rgb.size() != 3 || !rgb[0].is_number() ||
+          !rgb[1].is_number() || !rgb[2].is_number()) {
+        return;
+      }
       color->set_red(rgb[0].get<double>() / 255.0);
       color->set_green(rgb[1].get<double>() / 255.0);
       color->set_blue(rgb[2].get<double>() / 255.0);
@@ -589,13 +653,21 @@ void FillImages(const nlohmann::json& images, const UserSpaceOffset& offset,
                 pdfv1::PageChunk* chunk) {
   if (!images.contains("header") || !images.contains("data")) return;
   const auto& header = images["header"];
+  const auto& data = images["data"];
   const int ix0 = ColumnIndex(header, "x0");
   const int ikey = ColumnIndex(header, "xobject_key");
   const int iw = ColumnIndex(header, "image_width");
   const int ih = ColumnIndex(header, "image_height");
   const int ibpc = ColumnIndex(header, "bits_per_component");
   const int ics = ColumnIndex(header, "color_space");
-  for (const auto& row : images["data"]) {
+  if (!data.is_array() || ix0 < 0 ||
+      static_cast<size_t>(ix0) + 4 > header.size()) {
+    return;
+  }
+  for (const auto& row : data) {
+    if (!RowHasNumbers(row, header.size(), {ix0, ix0 + 1, ix0 + 2, ix0 + 3})) {
+      continue;
+    }
     auto* image = chunk->add_images();
     auto* bbox = image->mutable_bbox();
     bbox->set_x0(row[ix0 + 0].get<double>() + offset.dx);
@@ -611,14 +683,14 @@ void FillImages(const nlohmann::json& images, const UserSpaceOffset& offset,
     quad->set_y2(bbox->y1());
     quad->set_x3(bbox->x0());
     quad->set_y3(bbox->y1());
-    if (iw >= 0 && row[iw].is_number()) {
-      image->set_source_width_px(row[iw].get<uint32_t>());
+    if (iw >= 0) {
+      if (auto width = UInt32Of(row[iw])) image->set_source_width_px(*width);
     }
-    if (ih >= 0 && row[ih].is_number()) {
-      image->set_source_height_px(row[ih].get<uint32_t>());
+    if (ih >= 0) {
+      if (auto height = UInt32Of(row[ih])) image->set_source_height_px(*height);
     }
-    if (ibpc >= 0 && row[ibpc].is_number()) {
-      image->set_bits_per_component(row[ibpc].get<uint32_t>());
+    if (ibpc >= 0) {
+      if (auto bits = UInt32Of(row[ibpc])) image->set_bits_per_component(*bits);
     }
     if (ics >= 0 && row[ics].is_string()) {
       std::string cs = row[ics].get<std::string>();
@@ -636,9 +708,14 @@ void FillImages(const nlohmann::json& images, const UserSpaceOffset& offset,
 void FillHyperlinks(const nlohmann::json& links, pdfv1::PageChunk* chunk) {
   if (!links.is_array()) return;
   for (const auto& l : links) {
-    if (!l.contains("uri")) continue;
+    // The engine reports every /A link and leaves uri empty for actions
+    // other than /URI (GoTo and the rest). The contract types an internal
+    // link as a destination, which the engine does not resolve, and a link
+    // it cannot type is not emitted.
+    const std::string uri = StringOr(l, "uri");
+    if (uri.empty()) continue;
     auto* link = chunk->add_hyperlinks();
-    link->set_uri(l["uri"].get<std::string>());
+    link->set_uri(uri);
     // The link /Rect as stored: unrotated user space, the cells' frame.
     SetBox(NumberOr(l, "x0", 0.0), NumberOr(l, "y0", 0.0),
            NumberOr(l, "x1", 0.0), NumberOr(l, "y1", 0.0),
@@ -678,8 +755,9 @@ pdfv1::FormFieldKind FieldKind(const std::string& type, uint32_t flags) {
 void FillFormFields(const nlohmann::json& widgets, pdfv1::PageChunk* chunk) {
   if (!widgets.is_array()) return;
   for (const auto& w : widgets) {
+    if (!w.is_object()) continue;
     auto* field = chunk->add_form_fields();
-    const std::string type = w.value("field_type", "");
+    const std::string type = StringOr(w, "field_type");
     uint32_t flags = 0;
     if (w.contains("field_flags") && w["field_flags"].is_number_integer()) {
       flags = static_cast<uint32_t>(w["field_flags"].get<int64_t>());
@@ -688,8 +766,8 @@ void FillFormFields(const nlohmann::json& widgets, pdfv1::PageChunk* chunk) {
     }
     const pdfv1::FormFieldKind kind = FieldKind(type, flags);
     field->set_kind(kind);
-    field->set_name(w.value("field_name", ""));
-    std::string value = w.value("text", "");
+    field->set_name(StringOr(w, "field_name"));
+    std::string value = StringOr(w, "text");
     // A button's /V is a name, which the engine spells with its slash;
     // the other backends (PDFium, poppler) report the bare state name, so
     // this one does too.
@@ -699,9 +777,9 @@ void FillFormFields(const nlohmann::json& widgets, pdfv1::PageChunk* chunk) {
       value.erase(0, 1);
     }
     if (!value.empty()) field->set_value(value);
-    std::string desc = w.value("description", "");
+    std::string desc = StringOr(w, "description");
     if (!desc.empty()) field->set_alternate_name(desc);
-    std::string state = w.value("appearance_state", "");
+    std::string state = StringOr(w, "appearance_state");
     if (!state.empty()) field->set_appearance_state(state);
     // The widget /Rect as stored: unrotated user space, the cells' frame.
     SetBox(NumberOr(w, "x0", 0.0), NumberOr(w, "y0", 0.0),
@@ -711,7 +789,7 @@ void FillFormFields(const nlohmann::json& widgets, pdfv1::PageChunk* chunk) {
 }
 
 void FillOutlineNode(const nlohmann::json& entry, pdfv1::OutlineNode* node) {
-  node->set_title(entry.value("title", ""));
+  node->set_title(StringOr(entry, "title"));
   if (entry.contains("children") && entry["children"].is_array()) {
     for (const auto& child : entry["children"]) {
       FillOutlineNode(child, node->add_children());
@@ -1034,6 +1112,7 @@ grpc::Status QparseServiceImpl::Parse(
     chunk->set_page_index(static_cast<uint32_t>(i));
     pdfv1::FontTableChunk new_fonts;
     std::vector<pdfv1::EmbeddedFont> embedded;
+    uint64_t page_cells = 0;
 
     if (want_page_items) {
       try {
@@ -1057,7 +1136,7 @@ grpc::Status QparseServiceImpl::Parse(
         if (WantFamily(*request, pdfv1::PDF_FAMILY_TEXT_CELLS) &&
             sanitized.contains("cells")) {
           FillTextCells(sanitized["cells"], offset, page_fonts, &fonts, chunk,
-                        &new_fonts, &counts[pdfv1::PDF_FAMILY_TEXT_CELLS]);
+                        &new_fonts, &page_cells);
         }
         if (WantFamily(*request, pdfv1::PDF_FAMILY_VECTOR_SHAPES) &&
             sanitized.contains("shapes")) {
@@ -1103,6 +1182,7 @@ grpc::Status QparseServiceImpl::Parse(
       }
     }
 
+    counts[pdfv1::PDF_FAMILY_TEXT_CELLS] += page_cells;
     counts[pdfv1::PDF_FAMILY_PLACED_IMAGES] += chunk->images_size();
     counts[pdfv1::PDF_FAMILY_HYPERLINKS] += chunk->hyperlinks_size();
     counts[pdfv1::PDF_FAMILY_FORM_FIELDS] += chunk->form_fields_size();

@@ -513,6 +513,35 @@ int main(int argc, char** argv) {
           "rich.pdf's embedded-font cell resolves to UbuntuMono");
   }
 
+  // A link whose action is not a URI is not emitted: the engine leaves its
+  // uri empty and does not resolve destinations.
+  {
+    const std::string links = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+         "<< /Type /Page /Parent 2 0 R /Annots [4 0 R 5 0 R] >>",
+         "<< /Type /Annot /Subtype /Link /Rect [72 700 200 720] "
+         "/A << /S /URI /URI (https://example.com/kept) >> >>",
+         "<< /Type /Annot /Subtype /Link /Rect [72 600 200 620] "
+         "/A << /S /GoTo /D [3 0 R /Fit] >> >>"});
+    ParseResult parsed = ParseDocument(
+        stub.get(), links, {pdfv1::PDF_FAMILY_HYPERLINKS}, std::nullopt);
+    Check(parsed.status.ok() && parsed.pages.count(0) == 1 &&
+              parsed.pages[0].hyperlinks_size() == 1 &&
+              parsed.pages[0].hyperlinks(0).uri() ==
+                  "https://example.com/kept",
+          "a GoTo link is not emitted as an empty URI");
+    uint64_t counted = 0;
+    if (parsed.trailer.has_value()) {
+      for (const auto& count : parsed.trailer->counts()) {
+        if (count.family() == pdfv1::PDF_FAMILY_HYPERLINKS) {
+          counted = count.count();
+        }
+      }
+    }
+    Check(counted == 1, "the trailer counts only the links emitted");
+  }
+
   // Render hello.pdf at 72 DPI.
   {
     grpc::ClientContext ctx;
