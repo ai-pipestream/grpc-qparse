@@ -142,7 +142,9 @@ every page in the range, and a page whose raster would be wider or taller
 than 65535 pixels (the rasterizer's limit) or larger than the pixel budget
 fails the whole call with `RESOURCE_EXHAUSTED`, before any raster streams.
 A page the engine or the rasterizer fails on is skipped and the rest of
-the range still renders. The budget comes from the environment:
+the range still renders; the contract has no per-page warning on the
+Render stream, so the service logs the skipped page's index and the
+reason at ERROR. The budget comes from the environment:
 
 | Variable | Default | Meaning |
 |---|---|---|

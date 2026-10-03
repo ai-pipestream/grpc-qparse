@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
+#include <loguru.hpp>
 
 #include "qparse_service_impl.h"
 #include "sha256.h"
@@ -259,6 +261,25 @@ bool IsRed(const unsigned char* p) {
 bool IsInk(const unsigned char* p) {
   return p[0] < 100 && p[1] < 100 && p[2] < 100;
 }
+
+// The service's log lines at ERROR, collected from every server thread.
+struct ErrorLog {
+  std::mutex mutex;
+  std::vector<std::string> lines;
+
+  static void Collect(void* user_data, const loguru::Message& message) {
+    auto* log = static_cast<ErrorLog*>(user_data);
+    std::lock_guard<std::mutex> lock(log->mutex);
+    log->lines.emplace_back(message.message);
+  }
+
+  bool Contains(const std::string& text) {
+    std::lock_guard<std::mutex> lock(mutex);
+    return std::any_of(lines.begin(), lines.end(), [&](const std::string& l) {
+      return l.find(text) != std::string::npos;
+    });
+  }
+};
 
 }  // namespace
 
@@ -1332,6 +1353,21 @@ int main(int argc, char** argv) {
       }
     }
     Check(warned, "the trailer names the skipped page");
+
+    // Render has no per-page warning in the contract: the page is left out
+    // of the stream and the log says which page and why.
+    ErrorLog errors;
+    loguru::add_callback("render-skips", &ErrorLog::Collect, &errors,
+                         loguru::Verbosity_ERROR);
+    grpc::Status status;
+    std::vector<pdfv1::PageRaster> rasters = RenderDocument(
+        stub.get(), broken, 36.0, pdfv1::PIXEL_FORMAT_RGBA8, std::nullopt,
+        &status);
+    loguru::remove_callback("render-skips");
+    Check(status.ok() && rasters.size() == 1 && rasters[0].page_index() == 0,
+          "Render streams the good page without the undecodable one");
+    Check(errors.Contains("Render skips page 1:"),
+          "the log names the page Render skipped");
   }
 
   // A cancelled call stops decoding: Parse sends its header before any page

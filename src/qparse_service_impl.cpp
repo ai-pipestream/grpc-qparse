@@ -1439,11 +1439,15 @@ grpc::Status QparseServiceImpl::Render(
       return grpc::Status(grpc::StatusCode::CANCELLED,
                           "the call was cancelled");
     }
+    // The contract has no per-page warning on the Render stream, so a page
+    // left out of it is logged with its index and the reason.
     std::shared_ptr<pdflib::pdf_decoder<pdflib::PAGE>> decoder;
     try {
       ++decoded_pages_;
       decoder = loaded.pages->Decode(i, config);
-    } catch (const std::exception&) {
+    } catch (const std::exception& e) {
+      LOG_S(ERROR) << "Render skips page " << i
+                   << ": the engine could not decode it: " << e.what();
       continue;
     }
     pdflib::size_instruction size = SizeInstruction(loaded.pages->geometry(i));
@@ -1466,8 +1470,13 @@ grpc::Status QparseServiceImpl::Render(
         raster->set_dpi(dpi);
         FillPixels(*canvas, width, height, request->pixel_format(), raster);
         rendered = true;
+      } else {
+        LOG_S(ERROR) << "Render skips page " << i
+                     << ": the rasterizer produced no canvas of its size";
       }
-    } catch (const std::exception&) {
+    } catch (const std::exception& e) {
+      LOG_S(ERROR) << "Render skips page " << i
+                   << ": the rasterizer failed on it: " << e.what();
     }
     const std::array<double, 2> raster_size =
         RasterSize(loaded.pages->geometry(i), scale);
