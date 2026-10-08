@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.27@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+# syntax=docker/dockerfile:1.28@sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b
 # grpc-qparse image: the qpdf-based cell-parser PDF backend, published as a
 # linux/amd64 + linux/arm64 manifest list (each leg built and smoke-tested
 # natively on its own architecture).
@@ -30,7 +30,7 @@ ARG GRPC_QPARSE_RUNTIME_IMAGE=dhi.io/debian-base:trixie-debian13@sha256:20079b51
 # GetServiceInfo.
 ARG GRPC_QPARSE_BUILD_VERSION=dev
 
-FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS build
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates cmake g++ git make pkg-config zlib1g-dev \
