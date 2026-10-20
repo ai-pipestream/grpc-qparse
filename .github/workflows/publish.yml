@@ -2,9 +2,11 @@ name: Publish Images
 
 # Builds the service image (the build stage runs the test suite), boot-proofs
 # the runtime stage with scripts/smoke-test.sh, and only then names it on
-# docker.io/pipestreamai. Every push to main republishes :latest; a manual
-# dispatch with a version input also tags that version. Docker Hub
-# credentials come from the DOCKER_USER / DOCKER_TOKEN org secrets.
+# docker.io/pipestreamai. Every push to main republishes :latest. A push of
+# a v* tag (v0.3.0 publishes :0.3.0) or a manual dispatch with a version
+# input also tags that version beside :latest and stamps it as the
+# build_version GetServiceInfo reports (the commit sha otherwise). Docker
+# Hub credentials come from the DOCKER_USER / DOCKER_TOKEN org secrets.
 #
 # Build once, gate, then name. `load: true` cannot carry attestations and a
 # multi-platform image cannot be loaded at all, so every leg is built once
@@ -26,6 +28,7 @@ name: Publish Images
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       version:
@@ -40,8 +43,33 @@ env:
   HUB_REPO: docker.io/pipestreamai/grpc-qparse
 
 jobs:
+  version:
+    name: Resolve the version
+    runs-on: ubuntu-latest
+    outputs:
+      # Empty on a plain main push: only :latest is republished.
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Resolve the version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/tags/v*) version="${GITHUB_REF_NAME#v}" ;;
+            *) version="${INPUT_VERSION:-}" ;;
+          esac
+          if [ -n "$version" ] && ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]{0,63})?$ ]]; then
+            echo "::error::version '$version' is not a semantic version such as 0.3.0"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.platform }}
+    needs: version
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -80,14 +108,14 @@ jobs:
           platforms: ${{ matrix.platform }}
           provenance: mode=max
           sbom: true
-          # The ref name is always "main" here; the dispatch version, or the
-          # commit on a push, is what tells two images apart.
+          # The ref name is "main" or a v* tag here; the resolved version, or
+          # the commit on a main push, is what tells two images apart.
           build-args: |
-            GRPC_QPARSE_BUILD_VERSION=${{ inputs.version || github.sha }}
+            GRPC_QPARSE_BUILD_VERSION=${{ needs.version.outputs.version || github.sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ inputs.version || github.sha }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version || github.sha }}
           outputs: type=image,"name=${{ steps.names.outputs.names }}",push-by-digest=true,name-canonical=true,push=true
       - name: Boot-proof the pushed digest before it gets a name
         # The image under test is the exact digest that was pushed, pulled
@@ -115,7 +143,7 @@ jobs:
 
   publish:
     name: Publish the manifest list
-    needs: build
+    needs: [version, build]
     # One tag set, so a missing leg must not tag an incomplete index: only
     # assemble when every leg passed its build and smoke gate.
     if: ${{ !cancelled() && needs.build.result == 'success' }}
@@ -138,7 +166,7 @@ jobs:
           password: ${{ secrets.DOCKER_TOKEN }}
       - name: Create the manifest list and prove it
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           digests=()
