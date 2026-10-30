@@ -24,13 +24,13 @@
 # pinned to the manifest-list digest its tag named when it was pinned, so a
 # moved tag cannot change what is built; the tag stays for the reader.
 # Bump tag and digest together (docker buildx imagetools inspect <tag>).
-ARG GRPC_QPARSE_RUNTIME_IMAGE=dhi.io/debian-base:trixie-debian13@sha256:de80b468d8c492508f24b30e529accfaa8c59fe4505ddd72e969b324d276ad21
+ARG GRPC_QPARSE_RUNTIME_IMAGE=dhi.io/debian-base:trixie-debian13@sha256:feaf699b573671a25b33733f784646b0cc350f804d899005979edb7f38e251c7
 
 # The image tag passed by the publish workflow; becomes build_version in
 # GetServiceInfo.
 ARG GRPC_QPARSE_BUILD_VERSION=dev
 
-FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS build
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates cmake g++ git make pkg-config zlib1g-dev \
