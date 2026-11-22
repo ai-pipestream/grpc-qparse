@@ -54,6 +54,13 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   jpeglib's, and LZW through the replacement filter in
   `src/lzw_filter.{h,cpp}` (qpdf's has no limit). `test/fixtures/bomb.pdf`
   and `lzw.pdf` pin these.
+- `ParseStream` (bidi) lives in `src/parse_stream_session.*`: the session
+  assembles the chunked upload once and serves the open, `ParsePages` and
+  `RenderPages` through the same `ParseTo`/`RenderTo` bodies as `Parse` and
+  `Render` (the unary RPCs wrap their `ServerWriter` in a `MessageSink`), on
+  the stream's bytes, up to three requests of one stream at once, each
+  holding a call slot like a unary call. Uploads are capped at 2 GiB; a
+  verified upload goes into the document cache.
 - Default port is 50070 (`GRPC_QPARSE_PORT` overrides), the fleet-registered
   assignment in the workspace table; the backend fleet used to collide with
   gRParse/grPOIc/grpc-libreoffice on 50051-50053.

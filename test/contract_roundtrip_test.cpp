@@ -25,6 +25,7 @@
 #include <grpcpp/grpcpp.h>
 #include <loguru.hpp>
 
+#include "parse_stream_checks.h"
 #include "qparse_service_impl.h"
 #include "sha256.h"
 
@@ -1883,6 +1884,28 @@ int main(int argc, char** argv) {
     unsetenv("GRPC_QPARSE_QUEUE_TIMEOUT_S");
     Check(grpc_qparse::DefaultMaxConcurrentCalls() >= 2,
           "the default cap is at least 2");
+  }
+
+  // ParseStream: chunked upload, the open's parse, ParsePages and
+  // RenderPages on the same stream, cancel, the hash check, and the
+  // protocol's refusals. A verified upload is cached, so a client that
+  // falls back to the unary RPCs can address it by hash.
+  {
+    grpc_qparse::QparseServiceImpl stream_service;
+    int stream_port = 0;
+    std::unique_ptr<grpc::Server> stream_server =
+        StartServer(&stream_service, &stream_port);
+    auto stream_stub = Dial(stream_port);
+    parse_stream_checks::CheckAll(stream_stub.get(), hello, grpc_qparse::Sha256Hex(hello),
+                                  [](bool ok, const char* what) { Check(ok, what); });
+    grpc::ClientContext ctx;
+    pdfv1::ProbeRequest request;
+    request.mutable_document()->set_sha256(grpc_qparse::Sha256Hex(hello));
+    pdfv1::ProbeResponse response;
+    Check(stream_stub->Probe(&ctx, request, &response).ok() &&
+              response.capabilities().load_status() == pdfv1::LOAD_STATUS_OK,
+          "a ParseStream upload is cached for Probe by hash");
+    stream_server->Shutdown();
   }
 
   server->Shutdown();
