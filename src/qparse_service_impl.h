@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include <grpcpp/grpcpp.h>
@@ -9,6 +10,7 @@
 #include "ai/protomolt/parse/pdf/v1/pdf_backend_service.grpc.pb.h"
 #include "call_slots.h"
 #include "document_cache.h"
+#include "parse_stream_session.h"
 
 namespace grpc_qparse {
 
@@ -87,12 +89,37 @@ class QparseServiceImpl final
       const ai::protomolt::parse::pdf::v1::ServiceInfoRequest* request,
       ai::protomolt::parse::pdf::v1::ServiceInfoResponse* response) override;
 
+  // The bidirectional session (parse_stream_session.h): the chunked upload
+  // is assembled once, and the open, every ParsePages and every RenderPages
+  // are served by the same code as Parse and Render, on the stream's bytes
+  // with no re-upload and no cache lookup. Each request takes a call slot
+  // like a unary call.
+  grpc::Status ParseStream(
+      grpc::ServerContext* context,
+      grpc::ServerReaderWriter<
+          ai::protomolt::parse::pdf::v1::ParseStreamResponse,
+          ai::protomolt::parse::pdf::v1::ParseStreamRequest>* stream) override;
+
   // Pages the engine has decoded since the service started, across Parse
   // and Render. A call decodes only the pages its range names; tests read
   // this to prove it.
   uint64_t decoded_pages() const { return decoded_pages_.load(); }
 
  private:
+  // Parse and Render to any sink. stream_bytes, when set, are the document
+  // (a ParseStream's upload) and request->document() supplies only the
+  // password; otherwise the document resolves through the handshake.
+  grpc::Status ParseTo(
+      grpc::ServerContext* context,
+      const ai::protomolt::parse::pdf::v1::ParseRequest* request,
+      const std::shared_ptr<std::string>& stream_bytes,
+      MessageSink<ai::protomolt::parse::pdf::v1::ParseResponse>* writer);
+  grpc::Status RenderTo(
+      grpc::ServerContext* context,
+      const ai::protomolt::parse::pdf::v1::RenderRequest* request,
+      const std::shared_ptr<std::string>& stream_bytes,
+      MessageSink<ai::protomolt::parse::pdf::v1::RenderResponse>* writer);
+
   DocumentCache cache_;
   const RenderLimits render_limits_;
   CallSlots slots_;

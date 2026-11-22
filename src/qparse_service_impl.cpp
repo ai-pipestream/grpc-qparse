@@ -497,6 +497,29 @@ ResolveOutcome ResolveDocumentBytes(const pdfv1::PdfDocument& request,
   return ResolveOutcome::kOk;
 }
 
+// The largest ParseStream upload accepted: the document cache's default
+// byte ceiling. A stream is not held to the 520 MiB message limit, which
+// bounds each chunk instead.
+constexpr uint64_t kMaxStreamDocumentBytes = 2ull * 1024 * 1024 * 1024;
+
+// How many of one ParseStream's requests run at once; each also holds a
+// call slot (call_slots.h) while it decodes, so the process-wide bound
+// still holds.
+constexpr unsigned kStreamParallelRequests = 3;
+
+// A ParseStream request's bytes are the stream's upload, complete and
+// checked against the open's sha256 by the session already; any other
+// request resolves through the handshake.
+ResolveOutcome ResolveRequestBytes(const pdfv1::PdfDocument& request,
+                                   const std::shared_ptr<std::string>& stream_bytes,
+                                   DocumentCache* cache, LoadedDocument* out) {
+  if (stream_bytes != nullptr) {
+    out->buffer = stream_bytes;
+    return ResolveOutcome::kOk;
+  }
+  return ResolveDocumentBytes(request, cache, out);
+}
+
 // Opens the resolved bytes in the engine; with_pages also opens the
 // per-page handle Parse and Render work through.
 void LoadDocument(const pdfv1::PdfDocument& request, bool with_pages,
@@ -1473,6 +1496,14 @@ grpc::Status QparseServiceImpl::Probe(grpc::ServerContext* /*context*/,
 grpc::Status QparseServiceImpl::Parse(
     grpc::ServerContext* context, const pdfv1::ParseRequest* request,
     grpc::ServerWriter<pdfv1::ParseResponse>* writer) {
+  ServerWriterSink<pdfv1::ParseResponse> sink(writer);
+  return ParseTo(context, request, nullptr, &sink);
+}
+
+grpc::Status QparseServiceImpl::ParseTo(
+    grpc::ServerContext* context, const pdfv1::ParseRequest* request,
+    const std::shared_ptr<std::string>& stream_bytes,
+    MessageSink<pdfv1::ParseResponse>* writer) {
   if (request->has_pages()) {
     if (grpc::Status range = CheckPageRange(request->pages()); !range.ok()) {
       return range;
@@ -1483,7 +1514,7 @@ grpc::Status QparseServiceImpl::Parse(
     return admitted;
   }
   LoadedDocument loaded;
-  switch (ResolveDocumentBytes(request->document(), &cache_, &loaded)) {
+  switch (ResolveRequestBytes(request->document(), stream_bytes, &cache_, &loaded)) {
     case ResolveOutcome::kInvalidArgument:
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, loaded.detail);
     case ResolveOutcome::kVerdict:
@@ -1674,6 +1705,14 @@ grpc::Status QparseServiceImpl::Parse(
 grpc::Status QparseServiceImpl::Render(
     grpc::ServerContext* context, const pdfv1::RenderRequest* request,
     grpc::ServerWriter<pdfv1::RenderResponse>* writer) {
+  ServerWriterSink<pdfv1::RenderResponse> sink(writer);
+  return RenderTo(context, request, nullptr, &sink);
+}
+
+grpc::Status QparseServiceImpl::RenderTo(
+    grpc::ServerContext* context, const pdfv1::RenderRequest* request,
+    const std::shared_ptr<std::string>& stream_bytes,
+    MessageSink<pdfv1::RenderResponse>* writer) {
   // NaN fails every comparison, so it is rejected by name; the scale the
   // rasterizer takes is a float, which a tiny DPI rounds to zero.
   const double dpi = request->dpi();
@@ -1695,7 +1734,7 @@ grpc::Status QparseServiceImpl::Render(
     return admitted;
   }
   LoadedDocument loaded;
-  switch (ResolveDocumentBytes(request->document(), &cache_, &loaded)) {
+  switch (ResolveRequestBytes(request->document(), stream_bytes, &cache_, &loaded)) {
     case ResolveOutcome::kInvalidArgument:
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, loaded.detail);
     case ResolveOutcome::kVerdict:
@@ -1763,6 +1802,43 @@ grpc::Status QparseServiceImpl::Render(
     if (!writer->Write(msg)) return grpc::Status::OK;
   }
   return grpc::Status::OK;
+}
+
+grpc::Status QparseServiceImpl::ParseStream(
+    grpc::ServerContext* context,
+    grpc::ServerReaderWriter<pdfv1::ParseStreamResponse, pdfv1::ParseStreamRequest>*
+        stream) {
+  ParseStreamHandlers handlers;
+  handlers.parse = [this, context](const pdfv1::ParseRequest& request,
+                                   const std::shared_ptr<std::string>& bytes,
+                                   MessageSink<pdfv1::ParseResponse>* sink,
+                                   RequestCancel*) {
+    return ParseTo(context, &request, bytes, sink);
+  };
+  handlers.render = [this, context](const pdfv1::RenderRequest& request,
+                                    const std::shared_ptr<std::string>& bytes,
+                                    MessageSink<pdfv1::RenderResponse>* sink,
+                                    RequestCancel*) {
+    return RenderTo(context, &request, bytes, sink);
+  };
+  handlers.verdict = [](pdfv1::BackendCapabilities* caps, pdfv1::LoadStatus status,
+                        const std::string& detail) {
+    LoadedDocument verdict;
+    verdict.status = status;
+    verdict.detail = detail;
+    FillCapabilities(verdict, caps);
+  };
+  handlers.sha256_hex = [](const std::string& bytes) { return Sha256Hex(bytes); };
+  // A verified upload is cached like a verified unary upload, so a client
+  // that falls back to Probe, Parse or Render can address it by hash.
+  handlers.verified = [this](const std::string& sha256,
+                             const std::shared_ptr<std::string>& bytes) {
+    cache_.Insert(sha256, bytes);
+  };
+  ParseStreamLimits limits;
+  limits.max_document_bytes = kMaxStreamDocumentBytes;
+  limits.max_parallel_requests = kStreamParallelRequests;
+  return ServeParseStream(context, stream, handlers, limits);
 }
 
 grpc::Status QparseServiceImpl::GetServiceInfo(
