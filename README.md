@@ -170,10 +170,17 @@ NaN, infinity) is `INVALID_ARGUMENT`. Before it renders a page it sizes
 every page in the range, and a page whose raster would be wider or taller
 than 65535 pixels (the rasterizer's limit) or larger than the pixel budget
 fails the whole call with `RESOURCE_EXHAUSTED`, before any raster streams.
-A page the engine or the rasterizer fails on is skipped and the rest of
-the range still renders; the contract has no per-page warning on the
-Render stream, so the service logs the skipped page's index and the
-reason at ERROR. The budget comes from the environment:
+A page the engine cannot decode or the rasterizer fails on ends the call
+with `INTERNAL` at that page: the status message names the page index and
+the reason (`Render failed on page 3: ...`), and the same line is logged
+at ERROR. Rasters stream in page order, so the pages before it have
+arrived and none follows; an OK `Render` stream always carries every page
+of its range. Over `ParseStream` the `RenderPages` request ends
+`REQUEST_OUTCOME_ENGINE_ERROR` with that message as its detail, and the
+stream and its other requests carry on. `Parse` is different on purpose:
+it has a typed per-page warning in its trailer, so it leaves the page's
+chunk out, names the page there and finishes OK. The budget comes from
+the environment:
 
 | Variable | Default | Meaning |
 |---|---|---|
