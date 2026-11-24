@@ -21,6 +21,7 @@
 #include <qpdf/QPDFObjectHandle.hh>
 #include <qpdf/QPDFPageObjectHelper.hh>
 #include <qpdf/Pl_DCT.hh>
+#include <qpdf/Pl_Discard.hh>
 #include <qpdf/Pl_Flate.hh>
 #include <qpdf/Pl_RunLength.hh>
 
@@ -293,35 +294,135 @@ bool IsImage(QPDFObjectHandle xobject) {
          xobject.getDict().getKey("/Subtype").isNameAndEquals("/Image");
 }
 
-// Takes every image XObject with more than max_pixels pixels, or whose
-// /SMask or stencil /Mask has, out of the resource dictionaries a page
-// reaches, before the engine decodes a sample: the engine defilters a
-// page's every image whole, so a few kilobytes of deflated zeros declaring
-// 12000 x 12000 would otherwise cost the full sample buffer and the
-// rasterizer's copy of it. The page renders without the image. The edit
-// touches only this call's qpdf objects. Returns the dropped resource
-// names.
-std::vector<std::string> DropOversizedImages(QPDFObjectHandle resources,
-                                             uint64_t max_pixels) {
-  std::vector<std::string> dropped;
-  for (QPDFObjectHandle reachable : ReachableResources(resources)) {
-    QPDFObjectHandle xobjects = reachable.getKey("/XObject");
-    if (!xobjects.isDictionary()) continue;
-    for (const std::string& key : xobjects.getKeys()) {
-      QPDFObjectHandle image = xobjects.getKey(key);
-      if (!IsImage(image)) continue;
-      bool oversized = false;
-      for (QPDFObjectHandle part : {image, image.getDict().getKey("/SMask"),
-                                    image.getDict().getKey("/Mask")}) {
-        const std::optional<uint64_t> pixels = ImagePixels(part);
-        if (pixels.has_value() && *pixels > max_pixels) oversized = true;
-      }
-      if (!oversized) continue;
-      xobjects.removeKey(key);
-      dropped.push_back(key);
-    }
+// Text from qpdf or the engine for a proto string or a status message: cut
+// to max_bytes and held to printable ASCII, since it can quote bytes of the
+// document.
+std::string PrintableAscii(const std::string& text, size_t max_bytes) {
+  std::string out = text.substr(0, max_bytes);
+  for (char& c : out) {
+    if (c < 0x20 || c > 0x7e) c = '?';
   }
-  return dropped;
+  if (text.size() > max_bytes) out += "...";
+  return out;
+}
+
+// A resource name without its leading slash, so a name read from a qpdf
+// dictionary and one read from the engine's instruction list compare.
+std::string BareName(const std::string& name) {
+  return !name.empty() && name.front() == '/' ? name.substr(1) : name;
+}
+
+// The images over the pixel budget among those a page reaches, by the
+// objects that stand in for them. The engine defilters a page's every
+// image whole, so a few kilobytes of deflated zeros declaring 12000 x 12000
+// would otherwise cost the full sample buffer and the rasterizer's copy of
+// it. Each such image XObject, or one whose /SMask or stencil /Mask is over
+// the budget, is replaced in its resource dictionary by a one-pixel image
+// before the engine decodes a sample. The replacement only keeps the
+// decode cheap: a page that draws one is failed (DrawnOversizedImage),
+// never rendered with it. Resource dictionaries are shared between pages,
+// so the stand-ins are remembered for the life of the call's qpdf handle.
+class OversizedImages {
+ public:
+  // Replaces the oversized images in the resource dictionaries reachable
+  // from resources and returns the resource names of every stand-in found
+  // there, those of earlier pages included. The edit touches only this
+  // call's qpdf objects.
+  std::vector<std::string> Replace(QPDF* qpdf, QPDFObjectHandle resources,
+                                   uint64_t max_pixels) {
+    std::vector<std::string> names;
+    for (QPDFObjectHandle reachable : ReachableResources(resources)) {
+      QPDFObjectHandle xobjects = reachable.getKey("/XObject");
+      if (!xobjects.isDictionary()) continue;
+      for (const std::string& key : xobjects.getKeys()) {
+        QPDFObjectHandle image = xobjects.getKey(key);
+        if (image.isIndirect() && stand_ins_.count(image.getObjGen()) > 0) {
+          names.push_back(key);
+          continue;
+        }
+        if (!IsImage(image)) continue;
+        bool oversized = false;
+        for (QPDFObjectHandle part : {image, image.getDict().getKey("/SMask"),
+                                      image.getDict().getKey("/Mask")}) {
+          const std::optional<uint64_t> pixels = ImagePixels(part);
+          if (pixels.has_value() && *pixels > max_pixels) oversized = true;
+        }
+        if (!oversized) continue;
+        QPDFObjectHandle stand_in = qpdf->newStream(std::string(1, '\xff'));
+        QPDFObjectHandle dict = stand_in.getDict();
+        dict.replaceKey("/Type", QPDFObjectHandle::newName("/XObject"));
+        dict.replaceKey("/Subtype", QPDFObjectHandle::newName("/Image"));
+        dict.replaceKey("/Width", QPDFObjectHandle::newInteger(1));
+        dict.replaceKey("/Height", QPDFObjectHandle::newInteger(1));
+        dict.replaceKey("/ColorSpace", QPDFObjectHandle::newName("/DeviceGray"));
+        dict.replaceKey("/BitsPerComponent", QPDFObjectHandle::newInteger(8));
+        xobjects.replaceKey(key, stand_in);
+        stand_ins_.insert(stand_in.getObjGen());
+        names.push_back(key);
+      }
+    }
+    return names;
+  }
+
+ private:
+  std::set<QPDFObjGen> stand_ins_;
+};
+
+// Finds the first oversized image a decoded page draws: an image
+// instruction under one of the replaced resource names that carries the
+// stand-in's single pixel, or nothing. Duck-typed against
+// pdf_render_instructions::iterate_over_instructions.
+class DrawnOversizedImage {
+ public:
+  explicit DrawnOversizedImage(const std::vector<std::string>& replaced) {
+    for (const std::string& name : replaced) replaced_.insert(BareName(name));
+  }
+
+  void set_size(const pdflib::size_instruction&) {}
+  void render_text(pdflib::text_instruction&) {}
+  void render_widget(pdflib::text_widget_instruction&) {}
+  void render_shape(pdflib::shape_instruction&) {}
+  void render_shading(pdflib::shading_instruction&) {}
+
+  void render_bitmap(pdflib::bitmap_instruction& instr) {
+    if (found_.has_value() || instr.is_glyph()) return;
+    const std::string name = BareName(instr.get_key());
+    if (replaced_.count(name) == 0) return;
+    const std::array<int, 3>& shape = instr.get_shape();
+    if (instr.has_data() && (shape[0] > 1 || shape[1] > 1)) return;
+    found_ = "/" + name;
+  }
+
+  // The resource name of the oversized image the page draws, if any.
+  const std::optional<std::string>& found() const { return found_; }
+
+ private:
+  std::set<std::string> replaced_;
+  std::optional<std::string> found_;
+};
+
+// One qpdf warning as a ParseWarning's message says it: what qpdf was
+// reading, its message and where in the file, without the request's name.
+std::string QpdfWarningText(const QPDFExc& warning) {
+  std::string text = "qpdf: ";
+  if (!warning.getObject().empty()) text += warning.getObject() + ": ";
+  text += warning.getMessageDetail();
+  if (warning.getFilePosition() > 0) {
+    text += " (file offset " + std::to_string(warning.getFilePosition()) + ")";
+  }
+  return PrintableAscii(text, 512);
+}
+
+// Whether PDF version a ("1.4") is earlier than b ("1.7"). A string that
+// is not a version compares as 0.0.
+bool PdfVersionLess(const std::string& a, const std::string& b) {
+  auto parts = [](const std::string& v) {
+    int major = 0;
+    int minor = 0;
+    if (std::sscanf(v.c_str(), "%d.%d", &major, &minor) < 1) major = 0;
+    return std::pair<int, int>(major, minor);
+  };
+  return parts(a) < parts(b);
 }
 
 // Whether a page decode keeps the annotation appearances the engine draws
@@ -340,7 +441,10 @@ class DocumentPages {
   // with its message in error: a password qpdf refuses is
   // PASSWORD_REQUIRED, or PASSWORD_INCORRECT when the call supplied one,
   // damage qpdf cannot recover from is CORRUPT, and anything else is
-  // ENGINE_ERROR.
+  // ENGINE_ERROR. qpdf repairs what it can and says so in warnings, kept
+  // in load_warnings(); a document it had to repair, or whose page tree
+  // declares pages, and in which it then found no page is CORRUPT too, not
+  // an empty document.
   pdfv1::LoadStatus Open(const std::string& bytes,
                          const std::optional<std::string>& password,
                          std::string* error) {
@@ -348,9 +452,27 @@ class DocumentPages {
       qpdf_.setSuppressWarnings(true);
       qpdf_.processMemoryFile("grpc-qparse request", bytes.data(), bytes.size(),
                               password.has_value() ? password->c_str() : nullptr);
+      // Read before the pages: qpdf rewrites /Count when it has to flatten
+      // a damaged page tree.
+      QPDFObjectHandle count =
+          DictionaryKey(DictionaryKey(qpdf_.getRoot(), "/Pages"), "/Count");
+      if (count.isInteger()) declared_pages_ = count.getIntValue();
       pages_ = qpdf_.getAllPages();
       geometry_.reserve(pages_.size());
       for (const auto& page : pages_) geometry_.push_back(ReadPageGeometry(page));
+      load_warnings_ = qpdf_.getWarnings();
+      if (pages_.empty() &&
+          (!load_warnings_.empty() || declared_pages_.value_or(0) > 0)) {
+        *error = "no page could be read";
+        if (declared_pages_.value_or(0) > 0) {
+          *error += "; the page tree declares " +
+                    std::to_string(*declared_pages_);
+        }
+        if (!load_warnings_.empty()) {
+          *error += "; " + QpdfWarningText(load_warnings_.front());
+        }
+        return pdfv1::LOAD_STATUS_CORRUPT;
+      }
     } catch (const QPDFExc& e) {
       *error = e.what();
       switch (e.getErrorCode()) {
@@ -383,6 +505,131 @@ class DocumentPages {
         QPDFPageObjectHelper(page).getAttribute("/Resources", false));
   }
 
+  // What qpdf said while it opened the document and read its page tree.
+  const std::vector<QPDFExc>& load_warnings() const { return load_warnings_; }
+
+  // The page tree's /Count when it is not the number of pages qpdf found:
+  // qpdf leaves out a kid it cannot read without a warning.
+  std::optional<long long> MismatchedPageCount() const {
+    if (declared_pages_.has_value() &&
+        *declared_pages_ != static_cast<long long>(pages_.size())) {
+      return declared_pages_;
+    }
+    return std::nullopt;
+  }
+
+  // What qpdf said since the last call, or since the document opened:
+  // after a page's decode, its warnings about that page.
+  std::vector<QPDFExc> TakeWarnings() {
+    HoldWarnings();
+    return std::exchange(held_warnings_, {});
+  }
+
+  // Document metadata from the trailer's info dictionary, the header and
+  // the catalog. Text values come as UTF-8 whatever their encoding in the
+  // file; dates and /Trapped are carried as stored. An info value that is
+  // neither text, a name, a number nor a boolean has no place in the
+  // contract, and its key is returned in not_carried.
+  void FillDocMeta(pdfv1::DocMeta* meta, std::vector<std::string>* not_carried) {
+    meta->set_pdf_version(qpdf_.getPDFVersion());
+    QPDFObjectHandle root = qpdf_.getRoot();
+    // A catalog /Version later than the header's replaces it (ISO 32000-1,
+    // 7.2.2).
+    QPDFObjectHandle catalog_version = DictionaryKey(root, "/Version");
+    if (catalog_version.isName()) {
+      const std::string version = BareName(catalog_version.getName());
+      if (PdfVersionLess(meta->pdf_version(), version)) {
+        meta->set_pdf_version(version);
+      }
+    }
+    meta->set_linearized(qpdf_.isLinearized());
+    QPDFObjectHandle marked =
+        DictionaryKey(DictionaryKey(root, "/MarkInfo"), "/Marked");
+    meta->set_tagged(marked.isBool() && marked.getBoolValue());
+
+    QPDFObjectHandle info = qpdf_.getTrailer().getKey("/Info");
+    if (!info.isDictionary()) return;
+    for (const std::string& key : info.getKeys()) {
+      QPDFObjectHandle stored = info.getKey(key);
+      std::string value;
+      if (stored.isString()) {
+        value = stored.getUTF8Value();
+      } else if (stored.isName()) {
+        value = BareName(stored.getName());
+      } else if (stored.isInteger() || stored.isReal() || stored.isBool()) {
+        value = stored.unparse();
+      } else {
+        if (!stored.isNull()) not_carried->push_back(key);
+        continue;
+      }
+      if (key == "/Title") {
+        if (!value.empty()) meta->set_title(value);
+      } else if (key == "/Author") {
+        if (!value.empty()) meta->set_author(value);
+      } else if (key == "/Subject") {
+        if (!value.empty()) meta->set_subject(value);
+      } else if (key == "/Keywords") {
+        if (!value.empty()) meta->set_keywords(value);
+      } else if (key == "/Creator") {
+        if (!value.empty()) meta->set_creator(value);
+      } else if (key == "/Producer") {
+        if (!value.empty()) meta->set_producer(value);
+      } else if (key == "/CreationDate") {
+        if (!value.empty()) meta->set_created_raw(value);
+      } else if (key == "/ModDate") {
+        if (!value.empty()) meta->set_modified_raw(value);
+      } else if (key == "/Trapped") {
+        if (!value.empty()) meta->set_trapped(value);
+      } else {
+        auto* entry = meta->add_custom();
+        entry->set_key(BareName(key));
+        entry->set_value(value);
+      }
+    }
+  }
+
+  // Why the page's content cannot be read, when one of its content streams
+  // does not decode: a damaged or mislabelled filter, or a stream over the
+  // decoded stream limit. The engine reads a page's content streams as one
+  // and, when any of them fails, logs it and goes on with an empty page;
+  // this asks qpdf first, the same way the engine will, so the caller can
+  // say so. Costs one more decode of the page's content streams. What qpdf
+  // says meanwhile stays for TakeWarnings: it says some things only the
+  // first time it reads an object.
+  std::optional<std::string> UndecodableContent(int index) {
+    QPDFObjectHandle page = pages_.at(static_cast<size_t>(index));
+    std::optional<std::string> failure;
+    try {
+      for (QPDFObjectHandle stream :
+           QPDFPageObjectHelper(page).getPageContents()) {
+        if (!stream.isStream()) continue;
+        HoldWarnings();
+        const size_t said_before = held_warnings_.size();
+        Pl_Discard discard;
+        std::string reason;
+        bool decoded = false;
+        try {
+          decoded = stream.pipeStreamData(&discard, 0, qpdf_dl_specialized);
+        } catch (const std::exception& e) {
+          reason = e.what();
+        }
+        if (decoded) continue;
+        HoldWarnings();
+        for (size_t i = said_before; i < held_warnings_.size(); ++i) {
+          if (!reason.empty()) reason += "; ";
+          reason += held_warnings_[i].getMessageDetail();
+        }
+        if (reason.empty()) reason = "qpdf cannot undo its filters";
+        failure = "object " + stream.getObjGen().unparse(' ') + ": " + reason;
+        break;
+      }
+    } catch (const std::exception& e) {
+      failure = e.what();
+    }
+    if (failure.has_value()) *failure = PrintableAscii(*failure, 256);
+    return failure;
+  }
+
   // Decodes one page. The engine reads /CropBox and /Rotate from the page
   // dictionary alone, never through the page tree, and on a rotated page it
   // turns every cell, shape and image into display orientation and drops
@@ -392,14 +639,17 @@ class DocumentPages {
   // touch only this call's qpdf objects, never the bytes.
   //
   // When the call decodes image samples, max_image_pixels bounds every image
-  // the page reaches (DropOversizedImages); each image left out is logged.
+  // the page reaches (OversizedImages): an image over it is not decoded,
+  // and its resource name is added to oversized_images, for the caller to
+  // fail the page if it draws one (DrawnOversizedImage).
   // With AnnotationAppearances::kOmit the page's annotation array is taken
   // off before the decode, so no annotation appearance (markup, widget or
   // otherwise) reaches the instruction list.
   std::shared_ptr<pdflib::pdf_decoder<pdflib::PAGE>> Decode(
       int index, const pdflib::decode_config& config,
       std::optional<uint64_t> max_image_pixels = std::nullopt,
-      AnnotationAppearances annotations = AnnotationAppearances::kDraw) {
+      AnnotationAppearances annotations = AnnotationAppearances::kDraw,
+      std::vector<std::string>* oversized_images = nullptr) {
     QPDFObjectHandle page = pages_.at(static_cast<size_t>(index));
     const PageGeometry& page_geometry = geometry(index);
     page.replaceKey("/MediaBox", BoxArray(page_geometry.media_box));
@@ -423,13 +673,10 @@ class DocumentPages {
       }
     }
     if (config.extract_bitmap_pixels && max_image_pixels.has_value()) {
-      for (const std::string& name : DropOversizedImages(
-               QPDFPageObjectHelper(page).getAttribute("/Resources", false),
-               *max_image_pixels)) {
-        LOG_S(ERROR) << "page " << index << ": image " << name
-                     << " is left out, it has more than " << *max_image_pixels
-                     << " pixels";
-      }
+      std::vector<std::string> replaced = oversized_.Replace(
+          &qpdf_, QPDFPageObjectHelper(page).getAttribute("/Resources", false),
+          *max_image_pixels);
+      if (oversized_images != nullptr) *oversized_images = std::move(replaced);
     }
     auto decoder =
         std::make_shared<pdflib::pdf_decoder<pdflib::PAGE>>(page, index);
@@ -438,9 +685,22 @@ class DocumentPages {
   }
 
  private:
+  // Moves qpdf's warnings so far into held_warnings_; qpdf hands them out
+  // once.
+  void HoldWarnings() {
+    for (QPDFExc& warning : qpdf_.getWarnings()) {
+      held_warnings_.push_back(std::move(warning));
+    }
+  }
+
   QPDF qpdf_;
   std::vector<QPDFObjectHandle> pages_;
   std::vector<PageGeometry> geometry_;
+  std::vector<QPDFExc> load_warnings_;
+  // Warnings taken from qpdf and not yet given to the caller.
+  std::vector<QPDFExc> held_warnings_;
+  std::optional<long long> declared_pages_;
+  OversizedImages oversized_;
 };
 
 struct LoadedDocument {
@@ -520,10 +780,10 @@ ResolveOutcome ResolveRequestBytes(const pdfv1::PdfDocument& request,
   return ResolveDocumentBytes(request, cache, out);
 }
 
-// Opens the resolved bytes in the engine; with_pages also opens the
-// per-page handle Parse and Render work through.
-void LoadDocument(const pdfv1::PdfDocument& request, bool with_pages,
-                  LoadedDocument* out) {
+// Opens the resolved bytes in the engine and in the per-page handle Parse
+// and Render work through. Probe opens both too, so its verdict is the one
+// Parse and Render would give.
+void LoadDocument(const pdfv1::PdfDocument& request, LoadedDocument* out) {
   const std::string& data = *out->buffer;
   if (data.rfind("%PDF-", 0) != 0) {
     out->status = pdfv1::LOAD_STATUS_NOT_PDF;
@@ -541,14 +801,10 @@ void LoadDocument(const pdfv1::PdfDocument& request, bool with_pages,
   } catch (const std::exception& e) {
     out->detail = e.what();
   }
-  if (ok && !with_pages) {
-    out->status = pdfv1::LOAD_STATUS_OK;
-    return;
-  }
   // The engine reports an open failure as a plain false, so the call's own
   // qpdf handle, which Parse and Render need anyway, opens the bytes too:
   // its error code tells a password or damaged file apart from an engine
-  // failure.
+  // failure, and it keeps what qpdf had to repair.
   auto pages = std::make_unique<DocumentPages>();
   std::string pages_detail;
   const pdfv1::LoadStatus pages_status =
@@ -1384,19 +1640,16 @@ grpc::Status CheckRasterSizes(const DocumentPages& pages, PageSpan span,
 // The status a Render call ends with at a page it cannot produce. The
 // contract has no per-page message on the Render stream, so the page index
 // and the reason ride in the status (RequestDone.detail over ParseStream),
-// and the same line goes to the log. The reason is the engine's exception
-// text: it is cut to a length a status trailer carries and held to
-// printable ASCII, because it ends up in a proto string.
-grpc::Status RenderPageFailure(int index, const std::string& reason) {
-  constexpr size_t kMaxReasonBytes = 256;
-  std::string text = reason.substr(0, kMaxReasonBytes);
-  for (char& c : text) {
-    if (c < 0x20 || c > 0x7e) c = '?';
-  }
-  const std::string message =
-      "Render failed on page " + std::to_string(index) + ": " + text;
+// and the same line goes to the log. The reason may be the engine's
+// exception text: it is cut to a length a status trailer carries and held
+// to printable ASCII, because it ends up in a proto string.
+grpc::Status RenderPageFailure(
+    int index, const std::string& reason,
+    grpc::StatusCode code = grpc::StatusCode::INTERNAL) {
+  const std::string message = "Render failed on page " + std::to_string(index) +
+                              ": " + PrintableAscii(reason, 320);
   LOG_S(ERROR) << message;
-  return grpc::Status(grpc::StatusCode::INTERNAL, message);
+  return grpc::Status(code, message);
 }
 
 // Rasterizes one decoded page into msg's raster, over the request's
@@ -1441,6 +1694,42 @@ void AddPageWarning(pdfv1::ParseTrailer* trailer, int page_index,
   warning->set_message(message);
 }
 
+// The most different qpdf warnings one page, or the document's load, puts
+// in the trailer; the rest are counted. A badly damaged file can make qpdf
+// say thousands.
+constexpr size_t kMaxQpdfWarnings = 16;
+
+// Adds what qpdf said to the trailer's warnings: about the page given, or
+// with no page about the document as a whole. A warning qpdf repeats (it
+// says it again each time it reads the object) is added once.
+void AddQpdfWarnings(const std::vector<QPDFExc>& said,
+                     std::optional<int> page_index,
+                     pdfv1::ParseTrailer* trailer) {
+  auto add = [&](std::string message) {
+    auto* warning = trailer->add_warnings();
+    if (page_index.has_value()) {
+      warning->set_page_index(static_cast<uint32_t>(*page_index));
+    }
+    warning->set_message(std::move(message));
+  };
+  std::set<std::string> listed;
+  size_t unlisted = 0;
+  for (const QPDFExc& warning : said) {
+    std::string text = QpdfWarningText(warning);
+    if (listed.count(text) > 0) continue;
+    if (listed.size() >= kMaxQpdfWarnings) {
+      ++unlisted;
+      continue;
+    }
+    listed.insert(text);
+    add(std::move(text));
+  }
+  if (unlisted > 0) {
+    add("qpdf: " + std::to_string(unlisted) + " more warning(s) here, past the " +
+        std::to_string(kMaxQpdfWarnings) + " listed");
+  }
+}
+
 }  // namespace
 
 RenderLimits RenderLimitsFromEnv() {
@@ -1473,7 +1762,7 @@ void InitEngine(const std::string& resources_dir,
   // decoder has no limit, so ours replaces it. jpeglib is held to the same
   // bytes. qpdf's other decoders (ASCIIHex, ASCII85, Crypt) give at most
   // four bytes per input byte, and the engine's own image codecs are
-  // bounded by the pixels an image declares (DropOversizedImages).
+  // bounded by the pixels an image declares (OversizedImages).
   Pl_Flate::memory_limit(decoded_stream_limit);
   Pl_RunLength::setMemoryLimit(decoded_stream_limit);
   InstallLimitedLzwDecode(decoded_stream_limit);
@@ -1501,7 +1790,7 @@ grpc::Status QparseServiceImpl::Probe(grpc::ServerContext* /*context*/,
     case ResolveOutcome::kVerdict:
       break;
     case ResolveOutcome::kOk:
-      LoadDocument(request->document(), /*with_pages=*/false, &loaded);
+      LoadDocument(request->document(), &loaded);
       break;
   }
   FillCapabilities(loaded, response->mutable_capabilities());
@@ -1535,7 +1824,7 @@ grpc::Status QparseServiceImpl::ParseTo(
     case ResolveOutcome::kVerdict:
       break;
     case ResolveOutcome::kOk:
-      LoadDocument(request->document(), /*with_pages=*/true, &loaded);
+      LoadDocument(request->document(), &loaded);
       break;
   }
   const int page_count =
@@ -1554,15 +1843,41 @@ grpc::Status QparseServiceImpl::ParseTo(
   }
 
   bool client_ok = true;
+  std::map<pdfv1::PdfFamily, uint64_t> counts;
+  counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] = static_cast<uint64_t>(page_count);
+  pdfv1::ParseResponse trailer_msg;
+  auto* trailer = trailer_msg.mutable_trailer();
+  // What qpdf repaired to open the document: a rebuilt cross-reference
+  // table, an object it could not read. The document parsed, and the
+  // caller is told it was not whole.
+  AddQpdfWarnings(loaded.pages->load_warnings(), std::nullopt, trailer);
+  if (const std::optional<long long> declared =
+          loaded.pages->MismatchedPageCount()) {
+    auto* warning = trailer->add_warnings();
+    warning->set_family(pdfv1::PDF_FAMILY_PAGE_INVENTORY);
+    warning->set_message("the page tree declares " + std::to_string(*declared) +
+                         " page(s), " + std::to_string(page_count) +
+                         " could be read");
+  }
 
   // Document-level families.
   if (WantFamily(*request, pdfv1::PDF_FAMILY_DOC_METADATA)) {
     pdfv1::ParseResponse msg;
     auto* meta = msg.mutable_doc_meta();
+    std::vector<std::string> not_carried;
+    loaded.pages->FillDocMeta(meta, &not_carried);
+    for (const std::string& key : not_carried) {
+      auto* warning = trailer->add_warnings();
+      warning->set_family(pdfv1::PDF_FAMILY_DOC_METADATA);
+      warning->set_message("info key " + PrintableAscii(key, 128) +
+                           " is not carried: its value is not text, a name, "
+                           "a number or a boolean");
+    }
     nlohmann::json xmp = loaded.doc->get_meta_xml();
     if (xmp.is_string() && !xmp.get<std::string>().empty()) {
       meta->set_xmp_xml(xmp.get<std::string>());
     }
+    ++counts[pdfv1::PDF_FAMILY_DOC_METADATA];
     client_ok = writer->Write(msg);
   }
   if (client_ok && WantFamily(*request, pdfv1::PDF_FAMILY_OUTLINE)) {
@@ -1594,10 +1909,6 @@ grpc::Status QparseServiceImpl::ParseTo(
   const bool want_page_items = WantPageItems(*request);
   FontInterner fonts;
   std::set<uint32_t> programs_sent;
-  std::map<pdfv1::PdfFamily, uint64_t> counts;
-  counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] = static_cast<uint64_t>(page_count);
-  pdfv1::ParseResponse trailer_msg;
-  auto* trailer = trailer_msg.mutable_trailer();
   for (int i = span.begin; client_ok && i < span.end; ++i) {
     // A cancelled or expired call stops decoding at the next page.
     if (context->IsCancelled()) {
@@ -1612,6 +1923,16 @@ grpc::Status QparseServiceImpl::ParseTo(
     uint64_t page_cells = 0;
 
     if (want_page_items) {
+      // A content stream that does not decode leaves the engine with an
+      // empty page, which it returns as if the page were blank. The chunk
+      // still goes out, with what the page has besides its content (links,
+      // fields), and the trailer says the content is missing.
+      if (const std::optional<std::string> undecodable =
+              loaded.pages->UndecodableContent(i)) {
+        AddPageWarning(trailer, i,
+                       "content stream does not decode, the page's content "
+                       "is missing: " + *undecodable);
+      }
       try {
         ++decoded_pages_;
         std::shared_ptr<pdflib::pdf_decoder<pdflib::PAGE>> decoder =
@@ -1673,6 +1994,7 @@ grpc::Status QparseServiceImpl::ParseTo(
         // font never point at an entry the client has not seen.
         AddPageWarning(trailer, i,
                        std::string("page skipped: ") + e.what());
+        AddQpdfWarnings(loaded.pages->TakeWarnings(), i, trailer);
         if (new_fonts.fonts_size() > 0) {
           counts[pdfv1::PDF_FAMILY_FONTS] +=
               static_cast<uint64_t>(new_fonts.fonts_size());
@@ -1682,6 +2004,9 @@ grpc::Status QparseServiceImpl::ParseTo(
         }
         continue;
       }
+      // What qpdf said while the engine read the page: a stream it could
+      // not decode, an object it had to repair.
+      AddQpdfWarnings(loaded.pages->TakeWarnings(), i, trailer);
     }
 
     counts[pdfv1::PDF_FAMILY_TEXT_CELLS] += page_cells;
@@ -1755,7 +2080,7 @@ grpc::Status QparseServiceImpl::RenderTo(
     case ResolveOutcome::kVerdict:
       break;
     case ResolveOutcome::kOk:
-      LoadDocument(request->document(), /*with_pages=*/true, &loaded);
+      LoadDocument(request->document(), &loaded);
       break;
   }
   if (loaded.status != pdfv1::LOAD_STATUS_OK) {
@@ -1795,14 +2120,41 @@ grpc::Status QparseServiceImpl::RenderTo(
     }
     // A page that cannot be decoded or rasterized fails the call there: an
     // OK Render stream carries every page of its range.
+    // The engine would draw a page whose content stream does not decode
+    // as a blank page.
+    if (const std::optional<std::string> undecodable =
+            loaded.pages->UndecodableContent(i)) {
+      return RenderPageFailure(
+          i, "its content stream does not decode: " + *undecodable);
+    }
     std::shared_ptr<pdflib::pdf_decoder<pdflib::PAGE>> decoder;
+    std::vector<std::string> oversized_images;
     try {
       ++decoded_pages_;
       decoder = loaded.pages->Decode(i, config, render_limits_.max_pixels,
-                                     annotations);
+                                     annotations, &oversized_images);
     } catch (const std::exception& e) {
       return RenderPageFailure(
           i, std::string("the engine could not decode it: ") + e.what());
+    }
+    // The Render stream has no place for them yet; taking them keeps the
+    // handle from holding every page's warnings to the end of the call.
+    loaded.pages->TakeWarnings();
+    // An image over the pixel budget was never decoded. A page that draws
+    // one is not rendered without it; a page that only shares a resource
+    // dictionary with it is.
+    if (!oversized_images.empty()) {
+      DrawnOversizedImage drawn(oversized_images);
+      decoder->get_instructions().iterate_over_instructions(drawn);
+      if (drawn.found().has_value()) {
+        return RenderPageFailure(
+            i,
+            "it draws image " + *drawn.found() +
+                ", which has, or whose mask has, more than " +
+                std::to_string(render_limits_.max_pixels) +
+                " pixels (GRPC_QPARSE_RENDER_MAX_PIXELS)",
+            grpc::StatusCode::RESOURCE_EXHAUSTED);
+      }
     }
     const PageGeometry& geometry = loaded.pages->geometry(i);
     pdfv1::RenderResponse msg;
