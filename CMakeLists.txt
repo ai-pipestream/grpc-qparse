@@ -51,13 +51,13 @@ endif()
 # developer's build directory) would quietly keep building the old commit.
 # Bump them here.
 # ---------------------------------------------------------------------------
-set(PDF_PROTOS_COMMIT "dce4e90542329601b4604f0f49daea5b2de24c46")
+set(PDF_PROTOS_COMMIT "55db54ed2a49397bb76e3846a67853b58fe7c140")
 set(PDF_PROTOS_BASE_URL
     "https://raw.githubusercontent.com/ai-pipestream/parser-protos/${PDF_PROTOS_COMMIT}/proto/ai/protomolt/parse/pdf/v1")
 set(PDF_PROTO_TYPES_SHA256
     "c8a556c4f978c22f918d9dcbdb765951f591f6598cd59edef83bc75e855b2d44")
 set(PDF_PROTO_SERVICE_SHA256
-    "82cfb08ff4460ddaf0e4c366678951f38d189bdb2226424fdf2a7cf896cbe8da")
+    "c879d73aeacb6231d3ff8737602b362144629ebeaf6e4b9ad7754c1763eaf9cb")
 set(PDF_PROTO_LOCAL_DIR "" CACHE PATH "directory holding the contract protos, instead of the pinned download")
 
 set(STAGED_PROTO_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto")
@@ -240,6 +240,9 @@ add_executable(grpc_qparse
   src/main.cpp
   src/parse_stream_session.cpp
   src/qparse_service_impl.cpp
+  src/engine_tables.cpp
+  src/qpdf_readers.cpp
+  src/valid_utf8.cpp
   src/call_slots.cpp
   src/document_cache.cpp
   src/lzw_filter.cpp
@@ -259,6 +262,9 @@ add_executable(qparse_contract_test
   test/contract_roundtrip_test.cpp
   src/parse_stream_session.cpp
   src/qparse_service_impl.cpp
+  src/engine_tables.cpp
+  src/qpdf_readers.cpp
+  src/valid_utf8.cpp
   src/call_slots.cpp
   src/document_cache.cpp
   src/lzw_filter.cpp
@@ -272,3 +278,13 @@ target_link_libraries(qparse_contract_test PRIVATE pdf_backend_proto ${ENGINE_DE
 add_test(NAME qparse_contract COMMAND qparse_contract_test
   "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/hello.pdf"
   "${QPARSE_RESOURCES_DIR}")
+
+# The engine's JSON tables, fed in by hand: shapes the pinned engine never
+# writes, which the contract test cannot reach through the service.
+add_executable(qparse_engine_tables_test
+  test/engine_tables_test.cpp
+  src/engine_tables.cpp)
+target_include_directories(qparse_engine_tables_test PRIVATE src)
+target_include_directories(qparse_engine_tables_test SYSTEM PRIVATE "${TOPLEVEL_PREFIX_PATH}/src")
+target_link_libraries(qparse_engine_tables_test PRIVATE pdf_backend_proto ${ENGINE_DEPENDENCIES} grpc_qparse_flags)
+add_test(NAME qparse_engine_tables COMMAND qparse_engine_tables_test)

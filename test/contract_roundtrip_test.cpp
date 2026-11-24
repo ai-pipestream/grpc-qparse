@@ -821,34 +821,545 @@ int main(int argc, char** argv) {
           "a FONTS-only call on rich.pdf marks UbuntuMono embedded");
   }
 
-  // A link whose action is not a URI is not emitted: the engine leaves its
-  // uri empty and does not resolve destinations.
+  // Links are read from the page's annotations: a URI action is a uri, a
+  // GoTo action or a /Dest is a destination in the target page's frame,
+  // and what cannot be carried is said instead of dropped or made up.
   {
     const std::string links = AssemblePdf(
-        {"<< /Type /Catalog /Pages 2 0 R >>",
-         "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
-         "<< /Type /Page /Parent 2 0 R /Annots [4 0 R 5 0 R] >>",
+        {"<< /Type /Catalog /Pages 2 0 R /Dests << /chapter [4 0 R /FitH 500] "
+         ">> >>",
+         "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 "
+         "/MediaBox [0 0 612 792] >>",
+         "<< /Type /Page /Parent 2 0 R "
+         "/Annots [5 0 R 6 0 R 7 0 R 8 0 R 9 0 R 10 0 R 11 0 R] >>",
+         "<< /Type /Page /Parent 2 0 R /CropBox [10 20 600 700] >>",
          "<< /Type /Annot /Subtype /Link /Rect [72 700 200 720] "
          "/A << /S /URI /URI (https://example.com/kept) >> >>",
          "<< /Type /Annot /Subtype /Link /Rect [72 600 200 620] "
-         "/A << /S /GoTo /D [3 0 R /Fit] >> >>"});
+         "/A << /S /GoTo /D [4 0 R /XYZ 110 220 2] >> >>",
+         "<< /Type /Annot /Subtype /Link /Rect [72 500 200 520] "
+         "/Dest /chapter >>",
+         "<< /Type /Annot /Subtype /Link /Rect [72 400 200 420] "
+         "/A << /S /GoToR /F (other.pdf) /D [0 /Fit] >> >>",
+         "<< /Type /Annot /Subtype /Link /Rect [72 300 200 320] "
+         "/A << /S /GoTo /D [12 0 R /Fit] >> >>",
+         "<< /Type /Annot /Subtype /Link "
+         "/A << /S /URI /URI (https://example.com/no-rect) >> >>",
+         "<< /Subtype /Link /Rect [72 100 200 120] /Dest [3 0 R /Fit] >>",
+         "<< /Type /Page /MediaBox [0 0 612 792] >>"});
     ParseResult parsed = ParseDocument(
         stub.get(), links, {pdfv1::PDF_FAMILY_HYPERLINKS}, std::nullopt);
     Check(parsed.status.ok() && parsed.pages.count(0) == 1 &&
-              parsed.pages[0].hyperlinks_size() == 1 &&
-              parsed.pages[0].hyperlinks(0).uri() ==
-                  "https://example.com/kept",
-          "a GoTo link is not emitted as an empty URI");
-    uint64_t counted = 0;
-    if (parsed.trailer.has_value()) {
-      for (const auto& count : parsed.trailer->counts()) {
-        if (count.family() == pdfv1::PDF_FAMILY_HYPERLINKS) {
-          counted = count.count();
+              parsed.pages[0].hyperlinks_size() == 5,
+          "links: the five that can be typed are listed");
+    if (parsed.pages[0].hyperlinks_size() == 5) {
+      const auto& page = parsed.pages[0];
+      Check(page.hyperlinks(0).uri() == "https://example.com/kept" &&
+                !page.hyperlinks(0).has_destination() &&
+                BoxNear(page.hyperlinks(0).bbox(), {72, 700, 200, 720}, 0.01),
+            "links: a URI action is a uri with its /Rect");
+      const auto& go_to = page.hyperlinks(1);
+      Check(!go_to.has_uri() && go_to.destination().page_index() == 1 &&
+                Near(go_to.destination().x(), 100, 0.01) &&
+                Near(go_to.destination().y(), 200, 0.01) &&
+                Near(go_to.destination().zoom(), 2, 0.01),
+            "links: a GoTo action is a destination in the target page's "
+            "CropBox frame");
+      const auto& named = page.hyperlinks(2);
+      Check(named.destination().page_index() == 1 &&
+                !named.destination().has_x() &&
+                Near(named.destination().y(), 480, 0.01) &&
+                !named.destination().has_zoom(),
+            "links: a named /Dest is resolved through the catalog");
+      Check(page.hyperlinks(3).uri() == "https://example.com/no-rect" &&
+                !page.hyperlinks(3).has_bbox(),
+            "links: a link with no /Rect is listed with no bbox, not a "
+            "made-up one");
+      Check(page.hyperlinks(4).destination().page_index() == 0 &&
+                !page.hyperlinks(4).destination().has_x(),
+            "links: a /Dest with no /A and no /Type is listed");
+    }
+    Check(parsed.Count(pdfv1::PDF_FAMILY_HYPERLINKS) == 5,
+          "links: the trailer counts the links emitted");
+    auto said = [&parsed](const char* text) {
+      int found = 0;
+      for (const auto& w : parsed.PageWarnings(0)) {
+        if (w.family() == pdfv1::PDF_FAMILY_HYPERLINKS &&
+            w.message().find(text) != std::string::npos) {
+          ++found;
+        }
+      }
+      return found;
+    };
+    Check(said("/GoToR") == 1,
+          "links: an action the contract cannot type is a warning");
+    Check(said("the document does not hold") == 1,
+          "links: a destination on no page of the document is a warning");
+    Check(said("no usable /Rect") == 1,
+          "links: a missing /Rect is a warning");
+    Check(parsed.PageWarnings(0).size() == 3 && parsed.PageWarnings(1).empty(),
+          "links: nothing else is warned about");
+  }
+
+  // Form fields are read from the page's widget annotations. One without a
+  // /Rect is listed with no rect, and one whose field type is missing or
+  // unknown is listed with no kind, instead of being left out.
+  {
+    const std::string fields = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R 5 0 R "
+         "6 0 R] >> >>",
+         "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+         "<< /Type /Page /Parent 2 0 R /CropBox [12 24 600 780] "
+         "/Annots [4 0 R 5 0 R 6 0 R] >>",
+         "<< /Type /Annot /Subtype /Widget /FT /Tx /T (whole) /V (kept) "
+         "/Rect [112 124 212 144] /P 3 0 R >>",
+         "<< /Type /Annot /Subtype /Widget /FT /Tx /T (boxless) /V (too) "
+         "/P 3 0 R >>",
+         "<< /Type /Annot /Subtype /Widget /T (typeless) "
+         "/Rect [112 224 212 244] /P 3 0 R >>"});
+    ParseResult parsed = ParseDocument(
+        stub.get(), fields, {pdfv1::PDF_FAMILY_FORM_FIELDS}, std::nullopt);
+    Check(parsed.status.ok() && parsed.pages[0].form_fields_size() == 3,
+          "fields: all three widgets are listed");
+    if (parsed.pages[0].form_fields_size() == 3) {
+      const auto& page = parsed.pages[0];
+      Check(page.form_fields(0).name() == "whole" &&
+                page.form_fields(0).value() == "kept" &&
+                page.form_fields(0).kind() == pdfv1::FORM_FIELD_KIND_TEXT &&
+                BoxNear(page.form_fields(0).rect(), {100, 100, 200, 120}, 0.01),
+            "fields: a whole widget keeps its name, value and rect");
+      Check(page.form_fields(1).name() == "boxless" &&
+                page.form_fields(1).value() == "too" &&
+                !page.form_fields(1).has_rect(),
+            "fields: a widget with no /Rect is listed with no rect");
+      Check(page.form_fields(2).name() == "typeless" &&
+                page.form_fields(2).kind() ==
+                    pdfv1::FORM_FIELD_KIND_UNSPECIFIED &&
+                page.form_fields(2).has_rect(),
+            "fields: a widget with no field type is listed with no kind");
+    }
+    int rect_warnings = 0;
+    for (const auto& w : parsed.PageWarnings(0)) {
+      if (w.family() == pdfv1::PDF_FAMILY_FORM_FIELDS &&
+          w.message().find("no usable /Rect") != std::string::npos) {
+        ++rect_warnings;
+      }
+    }
+    Check(rect_warnings == 1 && parsed.PageWarnings(0).size() == 1,
+          "fields: the missing /Rect is the one warning");
+  }
+
+  // A sound document carries no warning. The engine asks each embedded
+  // font program's stream for its /Length1 to /Length3 as if the stream
+  // were a dictionary, and qpdf says so every time; that is about the
+  // engine's question, not about the document, and is not passed on.
+  {
+    const std::string fonts_pdf = ReadFile(fixture_dir + "/fonts.pdf");
+    const std::vector<pdfv1::PdfFamily> everything = {
+        pdfv1::PDF_FAMILY_TEXT_CELLS,     pdfv1::PDF_FAMILY_FONTS,
+        pdfv1::PDF_FAMILY_EMBEDDED_FONTS, pdfv1::PDF_FAMILY_PLACED_IMAGES,
+        pdfv1::PDF_FAMILY_VECTOR_SHAPES,  pdfv1::PDF_FAMILY_HYPERLINKS,
+        pdfv1::PDF_FAMILY_FORM_FIELDS,    pdfv1::PDF_FAMILY_OUTLINE,
+        pdfv1::PDF_FAMILY_DOC_METADATA};
+    for (const std::string* pdf : {&rich, &fonts_pdf}) {
+      ParseResult parsed =
+          ParseDocument(stub.get(), *pdf, everything, std::nullopt);
+      Check(parsed.status.ok() && parsed.trailer.has_value() &&
+                parsed.trailer->warnings_size() == 0,
+            "sound: a Parse of a sound document has no warning");
+      if (parsed.trailer.has_value()) {
+        for (const auto& w : parsed.trailer->warnings()) {
+          std::fprintf(stderr, "  unexpected warning: %s\n",
+                       w.message().c_str());
+        }
+      }
+      grpc::ClientContext ctx;
+      pdfv1::RenderRequest request;
+      request.mutable_document()->set_data(*pdf);
+      request.set_dpi(36);
+      request.set_pixel_format(pdfv1::PIXEL_FORMAT_RGBA8);
+      auto reader = stub->Render(&ctx, request);
+      pdfv1::RenderResponse msg;
+      int rasters = 0;
+      int warnings = 0;
+      while (reader->Read(&msg)) {
+        if (msg.has_raster()) ++rasters;
+        warnings += msg.warnings_size();
+      }
+      Check(reader->Finish().ok() && rasters > 0 && warnings == 0,
+            "sound: a Render of a sound document has no warning");
+    }
+  }
+
+  // A stream where the engine does expect a dictionary is the document's
+  // fault, and is still said: here the page's /Font resources are a
+  // stream.
+  {
+    const std::string stream_resources = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+         "<< /Type /Page /Parent 2 0 R /Contents 4 0 R "
+         "/Resources << /Font 5 0 R >> >>",
+         Stream("BT /F1 12 Tf 72 700 Td (Lost) Tj ET"), Stream("not fonts")});
+    ParseResult parsed = ParseDocument(stub.get(), stream_resources,
+                                       {pdfv1::PDF_FAMILY_TEXT_CELLS},
+                                       std::nullopt);
+    bool said = false;
+    for (const auto& w : parsed.PageWarnings(0)) {
+      said = said || w.message().find("stream object 5 0") != std::string::npos;
+    }
+    Check(parsed.status.ok() && parsed.trailer.has_value() && said,
+          "sound: a stream where a dictionary belongs is still a warning");
+  }
+
+  // Names are bytes, and a document may write any: a font named in a
+  // legacy encoding, a choice value, an appearance state, an info key.
+  // The contract's strings are UTF-8, and one that is not would cost the
+  // client the whole stream. Well-formed UTF-8 passes unchanged; any other
+  // byte is read as Latin-1, the rule grpc-pdfium and grpc-poppler follow.
+  {
+    const std::string legacy_names = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> >>",
+         "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+         "<< /Type /Page /Parent 2 0 R /Contents 4 0 R "
+         "/Resources << /Font << /F1 5 0 R /F2 9 0 R >> >> "
+         "/Annots [6 0 R 7 0 R] >>",
+         Stream("BT /F1 12 Tf 72 700 Td (Legacy) Tj ET\n"
+                "BT /F2 12 Tf 72 600 Td (Other) Tj ET"),
+         "<< /Type /Font /Subtype /Type1 /BaseFont /S#e9rif#8a >>",
+         "<< /Type /Annot /Subtype /Widget /FT /Btn /T (box) /V /caf#e9 "
+         "/AS /#e9tat /Rect [100 100 120 120] /P 3 0 R >>",
+         "<< /Type /Annot /Subtype /Link /Rect [100 200 120 220] "
+         "/A << /S /Lanc#e9 >> >>",
+         "<< /Cl#e9 (value) /Trapped /Peut-#eatre /T#c3#a9moin (kept) >>",
+         "<< /Type /Font /Subtype /Type1 /BaseFont /S#e8rif#8a >>"},
+        " /Info 8 0 R");
+    ParseResult parsed = ParseDocument(
+        stub.get(), legacy_names,
+        {pdfv1::PDF_FAMILY_TEXT_CELLS, pdfv1::PDF_FAMILY_FONTS,
+         pdfv1::PDF_FAMILY_FORM_FIELDS, pdfv1::PDF_FAMILY_HYPERLINKS,
+         pdfv1::PDF_FAMILY_DOC_METADATA},
+        std::nullopt);
+    Check(parsed.status.ok() && parsed.trailer.has_value(),
+          "names: the stream arrives whole, trailer included");
+    Check(parsed.pages[0].form_fields_size() == 1 &&
+              parsed.pages[0].form_fields(0).value() == "caf\xC3\xA9" &&
+              parsed.pages[0].form_fields(0).appearance_state() ==
+                  "/\xC3\xA9tat",
+          "names: a field's value and appearance state are read as Latin-1");
+    // The engine puts U+FFFD for each byte of a name that is not UTF-8, so
+    // these two fonts have one name to it. They are two fonts all the same.
+    const pdfv1::TextCell* legacy = FindCell(parsed.pages[0], "Legacy");
+    const pdfv1::TextCell* other = FindCell(parsed.pages[0], "Other");
+    Check(legacy != nullptr && other != nullptr &&
+              legacy->font_id() != other->font_id() &&
+              parsed.fonts.count(legacy->font_id()) == 1 &&
+              parsed.fonts.count(other->font_id()) == 1 &&
+              parsed.fonts[legacy->font_id()].base_name() ==
+                  "S\xC3\xA9rif\xC2\x8A" &&
+              parsed.fonts[other->font_id()].base_name() ==
+                  "S\xC3\xA8rif\xC2\x8A",
+          "names: two fonts named in a legacy encoding stay two fonts, each "
+          "with its name read as Latin-1");
+    bool custom_latin1 = false;
+    bool custom_utf8 = false;
+    bool trapped = false;
+    for (const auto& meta : parsed.doc_meta) {
+      trapped = trapped || meta.trapped() == "Peut-\xC3\xAAtre";
+      for (const auto& entry : meta.custom()) {
+        custom_latin1 = custom_latin1 || (entry.key() == "Cl\xC3\xA9" &&
+                                          entry.value() == "value");
+        custom_utf8 = custom_utf8 || (entry.key() == "T\xC3\xA9moin" &&
+                                      entry.value() == "kept");
+      }
+    }
+    Check(custom_latin1 && trapped,
+          "names: an info key and /Trapped are read as Latin-1");
+    Check(custom_utf8, "names: a key that is UTF-8 already is unchanged");
+    bool action_said = false;
+    for (const auto& w : parsed.PageWarnings(0)) {
+      action_said = action_said ||
+                    (w.family() == pdfv1::PDF_FAMILY_HYPERLINKS &&
+                     w.message().find("/Lanc") != std::string::npos);
+    }
+    Check(action_said, "names: the link's unknown action type is still said");
+
+    grpc::Status render_status;
+    const auto rasters =
+        RenderDocument(stub.get(), legacy_names, 36, pdfv1::PIXEL_FORMAT_RGBA8,
+                       std::nullopt, &render_status);
+    Check(render_status.ok() && rasters.size() == 1,
+          "names: the page still renders");
+  }
+
+  // The outline carries where each item leads, read from the document and
+  // not from the engine's titles-only list.
+  {
+    auto outline_of = [&stub](const std::string& pdf, ParseResult* parsed) {
+      grpc::ClientContext ctx;
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(pdf);
+      request.add_families(pdfv1::PDF_FAMILY_OUTLINE);
+      pdfv1::OutlineChunk outline;
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse msg;
+      while (reader->Read(&msg)) {
+        if (msg.has_outline()) outline = msg.outline();
+        if (msg.has_trailer()) parsed->trailer = msg.trailer();
+      }
+      parsed->status = reader->Finish();
+      return outline;
+    };
+    const std::string targets = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R /Names << /Dests << "
+         "/Names [(appendix) [4 0 R /XYZ 60 70 null]] >> >> >>",
+         "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 "
+         "/MediaBox [0 0 612 792] >>",
+         "<< /Type /Page /Parent 2 0 R >>",
+         "<< /Type /Page /Parent 2 0 R /CropBox [10 20 600 700] >>",
+         "<< /Type /Outlines /First 6 0 R /Last 10 0 R /Count 5 >>",
+         "<< /Title (Direct) /Parent 5 0 R /Next 7 0 R "
+         "/Dest [4 0 R /XYZ 110 220 0] /First 11 0 R /Last 11 0 R /Count 1 >>",
+         "<< /Title (Site) /Parent 5 0 R /Prev 6 0 R /Next 8 0 R "
+         "/A << /S /URI /URI (https://example.com/site) >> >>",
+         "<< /Title (Named) /Parent 5 0 R /Prev 7 0 R /Next 9 0 R "
+         "/A << /S /GoTo /D (appendix) >> >>",
+         "<< /Title (Gone) /Parent 5 0 R /Prev 8 0 R /Next 10 0 R "
+         "/Dest [12 0 R /Fit] >>",
+         "<< /Title <FEFF00DC0062006500720073> /Parent 5 0 R /Prev 9 0 R >>",
+         "<< /Title (Child) /Parent 6 0 R /Dest [3 0 R /FitV 30] >>",
+         "<< /Type /Page /MediaBox [0 0 612 792] >>"});
+    ParseResult parsed;
+    const pdfv1::OutlineChunk outline = outline_of(targets, &parsed);
+    Check(parsed.status.ok() && outline.roots_size() == 5,
+          "outline: five top-level items");
+    if (outline.roots_size() == 5) {
+      const auto& direct = outline.roots(0);
+      Check(direct.title() == "Direct" &&
+                direct.destination().page_index() == 1 &&
+                Near(direct.destination().x(), 100, 0.01) &&
+                Near(direct.destination().y(), 200, 0.01) &&
+                !direct.destination().has_zoom(),
+            "outline: a /Dest is a destination in the target page's frame");
+      Check(direct.children_size() == 1 &&
+                direct.children(0).title() == "Child" &&
+                direct.children(0).destination().page_index() == 0 &&
+                Near(direct.children(0).destination().x(), 30, 0.01) &&
+                !direct.children(0).destination().has_y(),
+            "outline: a child item keeps its own destination");
+      Check(outline.roots(1).uri() == "https://example.com/site" &&
+                !outline.roots(1).has_destination(),
+            "outline: a URI action is a uri");
+      Check(outline.roots(2).destination().page_index() == 1 &&
+                Near(outline.roots(2).destination().x(), 50, 0.01) &&
+                Near(outline.roots(2).destination().y(), 50, 0.01),
+            "outline: a named destination is resolved through the name tree");
+      Check(outline.roots(3).title() == "Gone" &&
+                !outline.roots(3).has_destination() &&
+                !outline.roots(3).has_uri(),
+            "outline: an item pointing at no page keeps its title only");
+      Check(outline.roots(4).title() == "\xC3\x9C" "bers",
+            "outline: a UTF-16 title arrives as UTF-8");
+    }
+    Check(parsed.DocumentWarnings().size() == 1 &&
+              parsed.DocumentWarnings()[0].family() ==
+                  pdfv1::PDF_FAMILY_OUTLINE &&
+              parsed.DocumentWarnings()[0].message().find(
+                  "1 outline item(s) point at a page the document does not "
+                  "hold") != std::string::npos,
+          "outline: the item with no page is a warning");
+    Check(parsed.Count(pdfv1::PDF_FAMILY_OUTLINE) == 6,
+          "outline: the trailer counts the items");
+
+    // A chain deeper than the walk follows, and a loop.
+    auto chain = [](int levels, bool loop) {
+      std::vector<std::string> objects = {
+          "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>",
+          "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+          "<< /Type /Page /Parent 2 0 R >>",
+          "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"};
+      for (int i = 0; i < levels; ++i) {
+        const int self = 5 + i;
+        std::string item = "<< /Title (L" + std::to_string(i) + ") /Parent " +
+                           std::to_string(self - 1) + " 0 R";
+        if (i + 1 < levels) {
+          const std::string child = std::to_string(self + 1) + " 0 R";
+          item += " /First " + child + " /Last " + child + " /Count 1";
+        } else if (loop) {
+          item += " /First 5 0 R /Next 5 0 R";
+        }
+        objects.push_back(item + " >>");
+      }
+      return AssemblePdf(objects);
+    };
+    auto depth_of = [](const pdfv1::OutlineChunk& chunk) {
+      int levels = 0;
+      const pdfv1::OutlineNode* node =
+          chunk.roots_size() > 0 ? &chunk.roots(0) : nullptr;
+      while (node != nullptr) {
+        ++levels;
+        node = node->children_size() > 0 ? &node->children(0) : nullptr;
+      }
+      return levels;
+    };
+    ParseResult deep;
+    Check(depth_of(outline_of(chain(70, false), &deep)) == 65,
+          "outline: 65 levels are sent");
+    Check(deep.DocumentWarnings().size() == 1 &&
+              deep.DocumentWarnings()[0].family() ==
+                  pdfv1::PDF_FAMILY_OUTLINE &&
+              deep.DocumentWarnings()[0].message().find("level 65") !=
+                  std::string::npos,
+          "outline: what lies deeper is a warning");
+    ParseResult whole;
+    Check(depth_of(outline_of(chain(65, false), &whole)) == 65 &&
+              whole.DocumentWarnings().empty(),
+          "outline: a chain that fits gets no warning");
+    ParseResult looped;
+    Check(depth_of(outline_of(chain(3, true), &looped)) == 3 &&
+              looped.status.ok(),
+          "outline: an item that is its own descendant is listed once");
+  }
+
+  // A file encrypted by a security handler qpdf does not implement is
+  // UNSUPPORTED_ENCRYPTION, the verdict the other backends give, not an
+  // engine error.
+  {
+    const std::string vault = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+         "<< /Type /Page /Parent 2 0 R >>",
+         "<< /Filter /Acme.Vault /V 4 /Length 128 >>"},
+        " /Encrypt 4 0 R /ID [<00112233445566778899aabbccddeeff> "
+        "<00112233445566778899aabbccddeeff>]");
+    grpc::ClientContext ctx;
+    pdfv1::ProbeRequest request;
+    request.mutable_document()->set_data(vault);
+    pdfv1::ProbeResponse response;
+    Check(stub->Probe(&ctx, request, &response).ok(),
+          "unsupported encryption: Probe answers");
+    Check(response.capabilities().load_status() ==
+              pdfv1::LOAD_STATUS_UNSUPPORTED_ENCRYPTION,
+          "unsupported encryption: the verdict is UNSUPPORTED_ENCRYPTION");
+    Check(response.capabilities().load_detail().find("encryption") !=
+              std::string::npos,
+          "unsupported encryption: the detail keeps qpdf's message");
+    ParseResult parsed = ParseDocument(stub.get(), vault, {}, std::nullopt);
+    Check(parsed.status.ok() &&
+              parsed.header.capabilities().load_status() ==
+                  pdfv1::LOAD_STATUS_UNSUPPORTED_ENCRYPTION,
+          "unsupported encryption: Parse gives the same verdict");
+  }
+
+  // A page with no usable /MediaBox is sized as US Letter, and says the
+  // box is a guess: in the Parse trailer, and beside the raster.
+  {
+    const std::string boxless = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>",
+         "<< /Type /Page /Parent 2 0 R >>",
+         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] >>",
+         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 0 0] >>"});
+    ParseResult parsed = ParseDocument(
+        stub.get(), boxless, {pdfv1::PDF_FAMILY_PAGE_INVENTORY}, std::nullopt);
+    Check(parsed.status.ok() && parsed.header.pages_size() == 3 &&
+              Near(parsed.header.pages(0).width_pts(), 612, 0.01) &&
+              Near(parsed.header.pages(1).width_pts(), 300, 0.01),
+          "no MediaBox: the page is sized as US Letter");
+    auto guessed = [&parsed](uint32_t page) {
+      int found = 0;
+      for (const auto& w : parsed.PageWarnings(page)) {
+        if (w.family() == pdfv1::PDF_FAMILY_PAGE_INVENTORY &&
+            w.message().find("/MediaBox") != std::string::npos) {
+          ++found;
+        }
+      }
+      return found;
+    };
+    Check(guessed(0) == 1 && guessed(2) == 1,
+          "no MediaBox: each such page has an inventory warning");
+    Check(guessed(1) == 0, "a page with a MediaBox has no such warning");
+
+    grpc::ClientContext ctx;
+    pdfv1::RenderRequest request;
+    request.mutable_document()->set_data(boxless);
+    request.set_dpi(18.0);
+    auto reader = stub->Render(&ctx, request);
+    pdfv1::RenderResponse msg;
+    std::map<uint32_t, int> render_warnings;
+    int rasters = 0;
+    while (reader->Read(&msg)) {
+      if (!msg.has_raster()) continue;
+      ++rasters;
+      for (const auto& w : msg.warnings()) {
+        if (w.family() == pdfv1::PDF_FAMILY_PAGE_RASTER && w.has_page_index() &&
+            w.page_index() == msg.raster().page_index() &&
+            w.message().find("/MediaBox") != std::string::npos) {
+          ++render_warnings[msg.raster().page_index()];
         }
       }
     }
-    Check(counted == 1, "the trailer counts only the links emitted");
+    Check(reader->Finish().ok() && rasters == 3, "no MediaBox: Render draws");
+    Check(render_warnings[0] == 1 && render_warnings[2] == 1 &&
+              render_warnings.count(1) == 0,
+          "no MediaBox: the guess rides beside the raster of its page");
   }
+
+  // include_image_data is not served: placed images carry geometry only.
+  // The capability says so, and a call that asked is told.
+  {
+    const std::string pixel = "\x80";
+    const std::string picture = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+         "<< /Type /Page /Parent 2 0 R /Contents 4 0 R "
+         "/Resources << /XObject << /Im1 5 0 R >> >> >>",
+         Stream("q 100 0 0 100 50 50 cm /Im1 Do Q"),
+         "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 "
+         "/ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n" +
+             pixel + "\nendstream"});
+    auto parse = [&stub, &picture](bool include_data) {
+      grpc::ClientContext ctx;
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(picture);
+      request.add_families(pdfv1::PDF_FAMILY_PLACED_IMAGES);
+      request.mutable_options()->set_include_image_data(include_data);
+      ParseResult result;
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse msg;
+      while (reader->Read(&msg)) {
+        if (msg.has_header()) result.header = msg.header();
+        if (msg.has_page()) result.pages[msg.page().page_index()] = msg.page();
+        if (msg.has_trailer()) result.trailer = msg.trailer();
+      }
+      result.status = reader->Finish();
+      return result;
+    };
+    ParseResult asked = parse(true);
+    Check(asked.status.ok() && asked.pages[0].images_size() == 1 &&
+              !asked.pages[0].images(0).has_image(),
+          "image data: the image is listed, with no pixels");
+    Check(asked.DocumentWarnings().size() == 1 &&
+              asked.DocumentWarnings()[0].family() ==
+                  pdfv1::PDF_FAMILY_PLACED_IMAGES &&
+              asked.DocumentWarnings()[0].message().find(
+                  "include_image_data") != std::string::npos,
+          "image data: a call that asked for pixels is told it gets none");
+    bool qualified = false;
+    for (const auto& family : asked.header.capabilities().families()) {
+      if (family.family() == pdfv1::PDF_FAMILY_PLACED_IMAGES) {
+        qualified = family.support() == pdfv1::FAMILY_SUPPORT_SUPPORTED &&
+                    family.detail().find("no image samples") !=
+                        std::string::npos;
+      }
+    }
+    Check(qualified, "image data: the capability says geometry only");
+    ParseResult plain = parse(false);
+    Check(plain.status.ok() && plain.pages[0].images_size() == 1 &&
+              plain.DocumentWarnings().empty(),
+          "image data: a call that did not ask gets no warning");
+  }
+
 
   // Render hello.pdf at 72 DPI.
   {
@@ -1342,6 +1853,35 @@ int main(int argc, char** argv) {
                 static_cast<unsigned char>(rasters[0].pixels()[center]) > 200,
             "the LZW bomb image is not drawn");
     }
+    // The raster is not the whole page, and the message that carries it
+    // says so; a page that decodes whole says nothing.
+    auto raster_warnings = [&stub, &lzw](uint32_t page, const char* text) {
+      grpc::ClientContext ctx;
+      pdfv1::RenderRequest request;
+      request.mutable_document()->set_data(lzw);
+      request.set_dpi(36.0);
+      request.mutable_pages()->set_begin(page);
+      request.mutable_pages()->set_end(page + 1);
+      auto reader = stub->Render(&ctx, request);
+      pdfv1::RenderResponse msg;
+      int found = 0;
+      while (reader->Read(&msg)) {
+        for (const auto& w : msg.warnings()) {
+          if (msg.has_raster() && w.family() == pdfv1::PDF_FAMILY_PAGE_RASTER &&
+              w.has_page_index() && w.page_index() == page &&
+              w.message().find(text) != std::string::npos) {
+            ++found;
+          }
+        }
+      }
+      return reader->Finish().ok() ? found : -1;
+    };
+    Check(raster_warnings(1, "missing from the raster") == 1,
+          "the image left out of the raster is a warning beside it");
+    Check(raster_warnings(1, "qpdf:") >= 1,
+          "what qpdf said about the page's image rides beside the raster too");
+    Check(raster_warnings(2, "") == 0,
+          "a page that renders whole has no warning beside its raster");
   }
 
   // The decoded stream limit comes from the environment; unset, zero or

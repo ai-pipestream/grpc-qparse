@@ -66,6 +66,29 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   (`OversizedImages`, `DrawnOversizedImage`). Do not go back to removing
   the image and rendering the page without it. `DocMeta` is filled from
   the same handle (`FillDocMeta`).
+- Links, form fields and the outline are read from qpdf into proto
+  messages (`src/qpdf_readers.*`), never from the engine's JSON. What the
+  contract cannot carry is counted in a warning, not dropped. The outline
+  is walked by hand: qpdf's outline helper cuts at level 50 silently.
+- The engine's cells, shapes and images tables are the only JSON still
+  read (`src/engine_tables.*`). A missing table or column throws
+  `EngineShapeError` and fails the page; a row that does not fit is
+  counted. Do not go back to reading a missing value as 0 or an empty
+  page. After an engine bump, run `qparse_engine_tables_test` and the
+  contract test: the "sound document has no warning" check goes red when
+  the shape moves.
+- Every message leaves through `Send`, which makes its strings valid
+  UTF-8 (`src/valid_utf8.*`; the file is not called `utf8.h` because the
+  engine includes utfcpp's header of that name). Do not call
+  `writer->Write` directly. Font names in `FontRef` are the document's
+  bytes (`FontFacts::written_name`), not the engine's U+FFFD form.
+- `TakePageWarnings` drops qpdf's type warning about a font program
+  stream, which the engine provokes on every embedded font. It matches
+  on qpdf's wording and object description; if a qpdf bump changes
+  either, the warnings come back and the contract test fails. Keep the
+  filter that narrow.
+- `getAllPages()` writes a Letter `/MediaBox` into a page that has none,
+  so `PagesWithoutMediaBox` walks the tree before it is called.
 - `ParseStream` (bidi) lives in `src/parse_stream_session.*`: the session
   assembles the chunked upload once and serves the open, `ParsePages` and
   `RenderPages` through the same `ParseTo`/`RenderTo` bodies as `Parse` and

@@ -29,8 +29,11 @@
 #include <parse.h>
 #include <render.h>
 
+#include "engine_tables.h"
 #include "lzw_filter.h"
+#include "qpdf_readers.h"
 #include "sha256.h"
+#include "valid_utf8.h"
 
 namespace grpc_qparse {
 
@@ -71,6 +74,12 @@ bool FamilySupported(pdfv1::PdfFamily family) {
   }
 }
 
+// Parse never decodes image samples (ParseDecodeConfig), so a placed image
+// is where it is and what its XObject declares, and nothing more.
+constexpr char kPlacedImagesDetail[] =
+    "placement, declared pixel size and color space only: no image samples, "
+    "ParseOptions.include_image_data is not served";
+
 const char* UnsupportedDetail(pdfv1::PdfFamily family) {
   switch (family) {
     case pdfv1::PDF_FAMILY_DEEP_RESOURCES:
@@ -86,8 +95,11 @@ const char* UnsupportedDetail(pdfv1::PdfFamily family) {
 // /Rotate may sit on any ancestor /Pages node (ISO 32000-1, 7.7.3.4).
 struct PageGeometry {
   // The MediaBox, lower-left corner first; US Letter when the page has no
-  // usable one, as PDFium falls back.
+  // usable one, as PDFium falls back, and media_box_guessed says so.
   std::array<double, 4> media_box = {0.0, 0.0, 612.0, 792.0};
+  // The page and its ancestors store no /MediaBox of four finite numbers
+  // spanning an area: media_box is the fallback, not the document's.
+  bool media_box_guessed = false;
   // The CropBox clipped to the MediaBox: the part of the page a viewer
   // shows and the renderer draws. The MediaBox when the page sets none.
   std::array<double, 4> crop_box = {0.0, 0.0, 612.0, 792.0};
@@ -145,6 +157,8 @@ PageGeometry ReadPageGeometry(QPDFObjectHandle page) {
   PageGeometry geometry;
   if (auto media = RectangleOf(helper.getAttribute("/MediaBox", false))) {
     geometry.media_box = *media;
+  } else {
+    geometry.media_box_guessed = true;
   }
   geometry.crop_box = geometry.media_box;
   if (auto crop = RectangleOf(helper.getAttribute("/CropBox", false))) {
@@ -158,6 +172,45 @@ PageGeometry ReadPageGeometry(QPDFObjectHandle page) {
   }
   geometry.rotation = RotationOf(helper.getAttribute("/Rotate", false));
   return geometry;
+}
+
+// The pages that neither store nor inherit a usable /MediaBox, found by
+// walking the page tree before QPDF::getAllPages() does: qpdf writes US
+// Letter into each page with no box at all, after which the page reads as
+// if the document had stored it. The nearest node that has the key decides,
+// as it does for ReadPageGeometry. A page that is not an indirect object
+// cannot be named here; qpdf's own warning about it is still passed on.
+std::set<QPDFObjGen> PagesWithoutMediaBox(QPDFObjectHandle root) {
+  struct Node {
+    QPDFObjectHandle node;
+    bool inherits_box;
+  };
+  std::set<QPDFObjGen> found;
+  std::set<QPDFObjGen> visited;
+  std::vector<Node> pending{{root, false}};
+  while (!pending.empty()) {
+    Node current = pending.back();
+    pending.pop_back();
+    if (!current.node.isDictionary()) continue;
+    if (current.node.isIndirect() &&
+        !visited.insert(current.node.getObjGen()).second) {
+      continue;
+    }
+    const bool has_box =
+        current.node.hasKey("/MediaBox")
+            ? RectangleOf(current.node.getKey("/MediaBox")).has_value()
+            : current.inherits_box;
+    QPDFObjectHandle kids = current.node.getKey("/Kids");
+    if (kids.isArray()) {
+      const int count = kids.getArrayNItems();
+      for (int i = 0; i < count; ++i) {
+        pending.push_back({kids.getArrayItem(i), has_box});
+      }
+    } else if (!has_box && current.node.isIndirect()) {
+      found.insert(current.node.getObjGen());
+    }
+  }
+  return found;
 }
 
 QPDFObjectHandle BoxArray(const std::array<double, 4>& box) {
@@ -191,7 +244,9 @@ QPDFObjectHandle DescendantFont(QPDFObjectHandle font) {
   return QPDFObjectHandle::newNull();
 }
 
-std::string EngineFontName(QPDFObjectHandle font) {
+// A font's name as the document writes it, from the places the engine
+// looks for one, in its order. A name is bytes, in any encoding.
+std::string WrittenFontName(QPDFObjectHandle font) {
   const QPDFObjectHandle descendant = DescendantFont(font);
   for (QPDFObjectHandle candidate :
        {DictionaryKey(DictionaryKey(font, "/FontDescriptor"), "/FontName"),
@@ -204,23 +259,46 @@ std::string EngineFontName(QPDFObjectHandle font) {
   return "null";
 }
 
-// Whether a font dictionary embeds its program: a /FontFile, /FontFile2
-// or /FontFile3 stream on its descriptor or its Type0 descendant's, or on
-// either dictionary itself, wherever the engine looks for one
-// (page_font.h init_font_program). Read from the dictionaries alone, so it
-// holds whether or not the call decodes programs.
-bool EmbedsProgram(QPDFObjectHandle font) {
-  auto has_program = [](QPDFObjectHandle dictionary) {
-    for (const char* key : {"/FontFile", "/FontFile2", "/FontFile3"}) {
-      if (DictionaryKey(dictionary, key).isStream()) return true;
-    }
-    return false;
-  };
+// The streams a font dictionary can take its program from: a /FontFile,
+// /FontFile2 or /FontFile3 stream on its descriptor or its Type0
+// descendant's, or on either dictionary itself, wherever the engine looks
+// for one (page_font.h init_font_program).
+std::vector<QPDFObjectHandle> ProgramStreamsOf(QPDFObjectHandle font) {
+  std::vector<QPDFObjectHandle> programs;
   const QPDFObjectHandle descendant = DescendantFont(font);
-  return has_program(DictionaryKey(font, "/FontDescriptor")) ||
-         has_program(DictionaryKey(descendant, "/FontDescriptor")) ||
-         has_program(font) || has_program(descendant);
+  for (QPDFObjectHandle dictionary :
+       {DictionaryKey(font, "/FontDescriptor"),
+        DictionaryKey(descendant, "/FontDescriptor"), font, descendant}) {
+    for (const char* key : {"/FontFile", "/FontFile2", "/FontFile3"}) {
+      QPDFObjectHandle program = DictionaryKey(dictionary, key);
+      if (program.isStream()) programs.push_back(program);
+    }
+  }
+  return programs;
 }
+
+// Whether a font dictionary embeds its program. Read from the
+// dictionaries alone, so it holds whether or not the call decodes
+// programs.
+bool EmbedsProgram(QPDFObjectHandle font) {
+  return !ProgramStreamsOf(font).empty();
+}
+
+// A name as the engine passes it on: where it is not UTF-8, the engine
+// puts U+FFFD for the bytes that are not (qpdf/object.h sanitize_utf8).
+// Two fonts named in a legacy encoding often come out alike that way, so
+// the engine's form is only the key a cell's font is found by.
+std::string EngineName(const std::string& written) {
+  return pdflib::qpdf_object::sanitize_utf8(written);
+}
+
+// What the document says of a font the engine names.
+struct FontFacts {
+  // Whether its dictionary embeds a program.
+  bool embedded = false;
+  // Its name as written, where the engine's form of it lost bytes.
+  std::string written_name;
+};
 
 // Every resource dictionary a page can draw from: its own, and those of
 // the form XObjects, tiling patterns and Type3 fonts it reaches, each
@@ -253,19 +331,22 @@ std::vector<QPDFObjectHandle> ReachableResources(QPDFObjectHandle resources) {
   return found;
 }
 
-// The fonts with an embedded program among those a page can draw with,
-// in every resource dictionary it reaches.
-std::set<FontKey> EmbeddedFontsOf(QPDFObjectHandle resources) {
-  std::set<FontKey> embedded;
+// The fonts a page can draw with, in every resource dictionary it
+// reaches, under the key the engine gives a cell's font. Two fonts the
+// engine cannot tell apart share an entry; the first one met stays.
+std::map<FontKey, FontFacts> FontFactsOf(QPDFObjectHandle resources) {
+  std::map<FontKey, FontFacts> facts;
   for (QPDFObjectHandle reachable : ReachableResources(resources)) {
     QPDFObjectHandle fonts = reachable.getKey("/Font");
     if (!fonts.isDictionary()) continue;
     for (const std::string& key : fonts.getKeys()) {
       QPDFObjectHandle font = fonts.getKey(key);
-      if (EmbedsProgram(font)) embedded.emplace(key, EngineFontName(font));
+      const std::string written = WrittenFontName(font);
+      facts.emplace(FontKey(EngineName(key), EngineName(written)),
+                    FontFacts{EmbedsProgram(font), written});
     }
   }
-  return embedded;
+  return facts;
 }
 
 // The pixels an image XObject declares, when it has a numeric /Width and
@@ -403,6 +484,40 @@ class DrawnOversizedImage {
 
 // One qpdf warning as a ParseWarning's message says it: what qpdf was
 // reading, its message and where in the file, without the request's name.
+// The images a decoded page draws that the engine has no samples for: the
+// stream did not decode (damaged, or past the decoded stream limit), and
+// the rasterizer draws nothing in their place. Duck-typed against
+// pdf_render_instructions::iterate_over_instructions.
+class ImagesWithoutSamples {
+ public:
+  void set_size(const pdflib::size_instruction&) {}
+  void render_text(pdflib::text_instruction&) {}
+  void render_widget(pdflib::text_widget_instruction&) {}
+  void render_shape(pdflib::shape_instruction&) {}
+  void render_shading(pdflib::shading_instruction&) {}
+
+  void render_bitmap(pdflib::bitmap_instruction& instr) {
+    if (instr.is_glyph() || instr.has_data()) return;
+    ++count_;
+    const std::string name = BareName(instr.get_key());
+    if (!name.empty()) names_.insert("/" + PrintableAscii(name, 48));
+  }
+
+  // How many times the page draws such an image.
+  uint64_t count() const { return count_; }
+  // Their resource names; an inline image has none.
+  const std::set<std::string>& names() const { return names_; }
+
+ private:
+  uint64_t count_ = 0;
+  std::set<std::string> names_;
+};
+
+// How qpdf's type warning starts when a stream is asked what only a
+// dictionary answers (QPDFObjectHandle::typeWarning).
+constexpr char kDictionaryAskedOfStream[] =
+    "operation for dictionary attempted on object of type stream";
+
 std::string QpdfWarningText(const QPDFExc& warning) {
   std::string text = "qpdf: ";
   if (!warning.getObject().empty()) text += warning.getObject() + ": ";
@@ -440,9 +555,10 @@ class DocumentPages {
   // place. Returns LOAD_STATUS_OK, or the verdict qpdf's error code gives
   // with its message in error: a password qpdf refuses is
   // PASSWORD_REQUIRED, or PASSWORD_INCORRECT when the call supplied one,
-  // damage qpdf cannot recover from is CORRUPT, and anything else is
-  // ENGINE_ERROR. qpdf repairs what it can and says so in warnings, kept
-  // in load_warnings(); a document it had to repair, or whose page tree
+  // damage qpdf cannot recover from is CORRUPT, encryption qpdf does not
+  // implement is UNSUPPORTED_ENCRYPTION, and anything else is ENGINE_ERROR.
+  // qpdf repairs what it can and says so in warnings, kept in
+  // load_warnings(); a document it had to repair, or whose page tree
   // declares pages, and in which it then found no page is CORRUPT too, not
   // an empty document.
   pdfv1::LoadStatus Open(const std::string& bytes,
@@ -457,9 +573,21 @@ class DocumentPages {
       QPDFObjectHandle count =
           DictionaryKey(DictionaryKey(qpdf_.getRoot(), "/Pages"), "/Count");
       if (count.isInteger()) declared_pages_ = count.getIntValue();
+      const std::set<QPDFObjGen> boxless =
+          PagesWithoutMediaBox(DictionaryKey(qpdf_.getRoot(), "/Pages"));
       pages_ = qpdf_.getAllPages();
       geometry_.reserve(pages_.size());
-      for (const auto& page : pages_) geometry_.push_back(ReadPageGeometry(page));
+      for (const auto& page : pages_) {
+        geometry_.push_back(ReadPageGeometry(page));
+        if (boxless.count(page.getObjGen()) > 0) {
+          geometry_.back().media_box_guessed = true;
+        }
+        const std::array<double, 4>& crop = geometry_.back().crop_box;
+        targets_.index_of.emplace(
+            page.getObjGen(),
+            static_cast<uint32_t>(targets_.crop_origin.size()));
+        targets_.crop_origin.push_back({crop[0], crop[1]});
+      }
       load_warnings_ = qpdf_.getWarnings();
       if (pages_.empty() &&
           (!load_warnings_.empty() || declared_pages_.value_or(0) > 0)) {
@@ -481,6 +609,13 @@ class DocumentPages {
                                       : pdfv1::LOAD_STATUS_PASSWORD_REQUIRED;
         case qpdf_e_damaged_pdf:
           return pdfv1::LOAD_STATUS_CORRUPT;
+        case qpdf_e_unsupported:
+          // qpdf found the trailer's /Encrypt and does not implement what
+          // it asks for: a security handler other than the standard one,
+          // or a /V or /R it does not know. Anything else it calls
+          // unsupported is not about encryption.
+          return qpdf_.isEncrypted() ? pdfv1::LOAD_STATUS_UNSUPPORTED_ENCRYPTION
+                                     : pdfv1::LOAD_STATUS_ENGINE_ERROR;
         default:
           return pdfv1::LOAD_STATUS_ENGINE_ERROR;
       }
@@ -497,11 +632,11 @@ class DocumentPages {
     return geometry_.at(static_cast<size_t>(index));
   }
 
-  // The fonts the page can draw with that embed their programs. Call it
-  // after Decode, which pins inherited resources on the page.
-  std::set<FontKey> EmbeddedFonts(int index) const {
+  // The fonts the page's content can draw with. Call it after Decode,
+  // which pins inherited resources on the page.
+  std::map<FontKey, FontFacts> Fonts(int index) const {
     QPDFObjectHandle page = pages_.at(static_cast<size_t>(index));
-    return EmbeddedFontsOf(
+    return FontFactsOf(
         QPDFPageObjectHelper(page).getAttribute("/Resources", false));
   }
 
@@ -523,6 +658,54 @@ class DocumentPages {
   std::vector<QPDFExc> TakeWarnings() {
     HoldWarnings();
     return std::exchange(held_warnings_, {});
+  }
+
+  // What qpdf said while the engine read a page, less what it said about
+  // the engine's own question. The engine asks each font program's stream
+  // for its /Length1 to /Length3 as if the stream were a dictionary
+  // (page_font.h), on every document with an embedded font, and qpdf
+  // answers each time with a type warning that says nothing about the
+  // document. Only that is left out, by the streams it names: a stream
+  // anywhere else the engine expects a dictionary is the document's fault
+  // and stays.
+  std::vector<QPDFExc> TakePageWarnings(int index) {
+    std::vector<QPDFExc> said = TakeWarnings();
+    const auto asked_a_stream = [](const QPDFExc& warning) {
+      return warning.getErrorCode() == qpdf_e_object &&
+             warning.getMessageDetail().rfind(kDictionaryAskedOfStream, 0) == 0;
+    };
+    if (std::none_of(said.begin(), said.end(), asked_a_stream)) return said;
+    std::set<std::string> programs;
+    try {
+      programs = FontProgramObjects(index);
+    } catch (const std::exception&) {
+      // The walk met an object qpdf cannot read; nothing is left out.
+      return said;
+    }
+    said.erase(std::remove_if(said.begin(), said.end(),
+                              [&](const QPDFExc& warning) {
+                                return asked_a_stream(warning) &&
+                                       programs.count(warning.getObject()) > 0;
+                              }),
+               said.end());
+    return said;
+  }
+
+  // The outline, a page's links and a page's form fields, read from the
+  // document itself (qpdf_readers.h).
+  bool HasOutline() { return grpc_qparse::HasOutline(qpdf_); }
+  OutlineRead ReadOutline(pdfv1::OutlineChunk* out) {
+    return grpc_qparse::ReadOutline(qpdf_, targets_, out);
+  }
+  LinksRead ReadLinks(int index, pdfv1::PageChunk* chunk) {
+    const size_t i = static_cast<size_t>(index);
+    return grpc_qparse::ReadLinks(qpdf_, pages_.at(i), targets_,
+                                  targets_.crop_origin.at(i), chunk);
+  }
+  FieldsRead ReadFormFields(int index, pdfv1::PageChunk* chunk) {
+    const size_t i = static_cast<size_t>(index);
+    return grpc_qparse::ReadFormFields(pages_.at(i), targets_.crop_origin.at(i),
+                                       chunk);
   }
 
   // Document metadata from the trailer's info dictionary, the header and
@@ -685,6 +868,47 @@ class DocumentPages {
   }
 
  private:
+  // How a qpdf warning names each font program stream the engine can load
+  // for a page: those of the fonts the page's content reaches, of its
+  // annotations' normal appearances, and of the form's default resources.
+  std::set<std::string> FontProgramObjects(int index) {
+    QPDFObjectHandle page = pages_.at(static_cast<size_t>(index));
+    std::vector<QPDFObjectHandle> roots = {
+        QPDFPageObjectHelper(page).getAttribute("/Resources", false),
+        DictionaryKey(DictionaryKey(qpdf_.getRoot(), "/AcroForm"), "/DR")};
+    auto add_appearance = [&roots](QPDFObjectHandle appearance) {
+      if (appearance.isStream()) {
+        roots.push_back(appearance.getDict().getKey("/Resources"));
+      }
+    };
+    QPDFObjectHandle annotations = DictionaryKey(page, "/Annots");
+    if (annotations.isArray()) {
+      for (QPDFObjectHandle annotation : annotations.aitems()) {
+        QPDFObjectHandle normal =
+            DictionaryKey(DictionaryKey(annotation, "/AP"), "/N");
+        add_appearance(normal);
+        if (!normal.isDictionary()) continue;
+        for (const std::string& state : normal.getKeys()) {
+          add_appearance(normal.getKey(state));
+        }
+      }
+    }
+    std::set<std::string> named;
+    for (QPDFObjectHandle root : roots) {
+      for (QPDFObjectHandle reachable : ReachableResources(root)) {
+        QPDFObjectHandle fonts = reachable.getKey("/Font");
+        if (!fonts.isDictionary()) continue;
+        for (const std::string& key : fonts.getKeys()) {
+          for (QPDFObjectHandle program : ProgramStreamsOf(fonts.getKey(key))) {
+            named.insert(qpdf_.getFilename() + ", stream object " +
+                         program.getObjGen().unparse(' '));
+          }
+        }
+      }
+    }
+    return named;
+  }
+
   // Moves qpdf's warnings so far into held_warnings_; qpdf hands them out
   // once.
   void HoldWarnings() {
@@ -696,6 +920,8 @@ class DocumentPages {
   QPDF qpdf_;
   std::vector<QPDFObjectHandle> pages_;
   std::vector<PageGeometry> geometry_;
+  // Where destinations lead: each page's object and frame origin.
+  PageTargets targets_;
   std::vector<QPDFExc> load_warnings_;
   // Warnings taken from qpdf and not yet given to the caller.
   std::vector<QPDFExc> held_warnings_;
@@ -835,8 +1061,7 @@ void FillCapabilities(const LoadedDocument& loaded,
   }
   caps->set_page_count(
       static_cast<uint32_t>(loaded.doc->get_number_of_pages()));
-  nlohmann::json toc = loaded.doc->get_table_of_contents();
-  bool has_outline = toc.is_array() ? !toc.empty() : toc.is_object();
+  const bool has_outline = loaded.pages->HasOutline();
   for (int f = pdfv1::PdfFamily_MIN + 1; f <= pdfv1::PdfFamily_MAX; ++f) {
     if (!pdfv1::PdfFamily_IsValid(f)) continue;
     auto family = static_cast<pdfv1::PdfFamily>(f);
@@ -849,6 +1074,9 @@ void FillCapabilities(const LoadedDocument& loaded,
       verdict->set_support(pdfv1::FAMILY_SUPPORT_ABSENT_IN_DOCUMENT);
     } else {
       verdict->set_support(pdfv1::FAMILY_SUPPORT_SUPPORTED);
+      if (family == pdfv1::PDF_FAMILY_PLACED_IMAGES) {
+        verdict->set_detail(kPlacedImagesDetail);
+      }
     }
   }
 }
@@ -857,35 +1085,6 @@ bool WantFamily(const pdfv1::ParseRequest& request, pdfv1::PdfFamily family) {
   if (request.families().empty()) return true;
   return std::find(request.families().begin(), request.families().end(),
                    family) != request.families().end();
-}
-
-// The engine's page JSON is read defensively: a field of an unexpected type
-// reads as absent instead of throwing, and a table row is checked before it
-// is indexed, so a schema change in the engine skips data rather than
-// aborting the stream or reading out of bounds.
-
-double NumberOr(const nlohmann::json& j, const char* key, double fallback) {
-  auto it = j.find(key);
-  return it != j.end() && it->is_number() ? it->get<double>() : fallback;
-}
-
-std::string StringOr(const nlohmann::json& j, const char* key) {
-  auto it = j.find(key);
-  return it != j.end() && it->is_string() ? it->get<std::string>()
-                                          : std::string();
-}
-
-// A count the contract stores as uint32, when the value is one.
-std::optional<uint32_t> UInt32Of(const nlohmann::json& value) {
-  if (!value.is_number_integer()) return std::nullopt;
-  if (value.is_number_unsigned()) {
-    const auto v = value.get<uint64_t>();
-    if (v > UINT32_MAX) return std::nullopt;
-    return static_cast<uint32_t>(v);
-  }
-  const auto v = value.get<int64_t>();
-  if (v < 0 || v > static_cast<int64_t>(UINT32_MAX)) return std::nullopt;
-  return static_cast<uint32_t>(v);
 }
 
 // Sets an axis-aligned box from two corners in either order; annotation
@@ -916,41 +1115,6 @@ void FillPageInfo(const PageGeometry& geometry, int index,
   info->set_page_space(pdfv1::PAGE_SPACE_CROP_BOX);
 }
 
-// The shift that puts a coordinate into the contract frame, unrotated user
-// space with the CropBox's lower-left corner at (0, 0). The engine moves
-// sanitized cells, shapes and images to the origin of its page boundary
-// (the MediaBox, see ParseDecodeConfig), so they move by the MediaBox
-// origin less the CropBox origin; link and widget rectangles come as
-// stored, in user space, and move by the CropBox origin alone.
-struct PageSpaceOffset {
-  double dx = 0.0;
-  double dy = 0.0;
-};
-
-// Column indices resolved from a header+data table once per table; -1 when
-// the table has no such column.
-int ColumnIndex(const nlohmann::json& header, const std::string& name) {
-  if (!header.is_array()) return -1;
-  for (size_t i = 0; i < header.size(); ++i) {
-    if (header[i].is_string() &&
-        header[i].get_ref<const std::string&>() == name) {
-      return static_cast<int>(i);
-    }
-  }
-  return -1;
-}
-
-// Whether a table row has the header's width and numbers in the columns
-// the caller is about to read.
-bool RowHasNumbers(const nlohmann::json& row, size_t width,
-                   std::initializer_list<int> columns) {
-  if (!row.is_array() || row.size() != width) return false;
-  for (int column : columns) {
-    if (!row[static_cast<size_t>(column)].is_number()) return false;
-  }
-  return true;
-}
-
 using FontProgram = std::shared_ptr<const pdflib::embedded_font_blob>;
 
 // Assigns stable font ids within one stream. A font is the name the engine
@@ -963,9 +1127,9 @@ class FontInterner {
   // Returns the font's id, announcing a font seen for the first time in
   // new_fonts, marked embedded when its dictionary embeds a program whether
   // or not the call decoded it.
-  uint32_t Intern(const std::string& engine_name, const FontProgram& program,
+  uint32_t Intern(const std::string& written_name, const FontProgram& program,
                   bool embedded, pdfv1::FontTableChunk* new_fonts) {
-    std::string name = engine_name;
+    std::string name = written_name;
     if (!name.empty() && name.front() == '/') name.erase(0, 1);
     std::pair<std::string, std::string> key(
         name, program != nullptr ? program->get_cache_key() : std::string());
@@ -992,7 +1156,8 @@ class PageFonts {
  public:
   using Key = FontKey;
 
-  explicit PageFonts(std::set<Key> embedded) : embedded_(std::move(embedded)) {}
+  explicit PageFonts(std::map<Key, FontFacts> facts)
+      : facts_(std::move(facts)) {}
 
   void set_size(const pdflib::size_instruction&) {}
   void render_widget(pdflib::text_widget_instruction&) {}
@@ -1017,313 +1182,25 @@ class PageFonts {
   // Whether the font's dictionary embeds a program, decoded or not.
   bool Embedded(const std::string& font_key,
                 const std::string& font_name) const {
-    return embedded_.count(Key(font_key, font_name)) > 0;
+    const auto it = facts_.find(Key(font_key, font_name));
+    return it != facts_.end() && it->second.embedded;
+  }
+
+  // The font's name as the document writes it. A font the page's own
+  // resources do not reach (one an annotation's appearance brings) keeps
+  // the engine's form of its name.
+  const std::string& WrittenName(const std::string& font_key,
+                                 const std::string& font_name) const {
+    const auto it = facts_.find(Key(font_key, font_name));
+    return it != facts_.end() ? it->second.written_name : font_name;
   }
 
   const std::map<Key, FontProgram>& fonts() const { return fonts_; }
 
  private:
-  std::set<Key> embedded_;
+  std::map<Key, FontFacts> facts_;
   std::map<Key, FontProgram> fonts_;
 };
-
-void FillTextCells(const nlohmann::json& cells, const PageSpaceOffset& offset,
-                   const PageFonts& page_fonts, FontInterner* fonts,
-                   pdfv1::PageChunk* chunk, pdfv1::FontTableChunk* new_fonts,
-                   uint64_t* cell_count) {
-  if (!cells.contains("header") || !cells.contains("data")) return;
-  const auto& header = cells["header"];
-  const auto& data = cells["data"];
-  const int ix0 = ColumnIndex(header, "x0");
-  const int iy0 = ColumnIndex(header, "y0");
-  const int ix1 = ColumnIndex(header, "x1");
-  const int iy1 = ColumnIndex(header, "y1");
-  const int irx0 = ColumnIndex(header, "r_x0");
-  const int itext = ColumnIndex(header, "text");
-  const int imode = ColumnIndex(header, "rendering-mode");
-  const int ispace = ColumnIndex(header, "space-width");
-  const int ifont = ColumnIndex(header, "font-name");
-  const int ifontkey = ColumnIndex(header, "font-key");
-  const int iltr = ColumnIndex(header, "left_to_right");
-  const int iwidget = ColumnIndex(header, "widget");
-  // A table without its geometry or text columns is not one this can read.
-  if (!data.is_array() || ix0 < 0 || iy0 < 0 || ix1 < 0 || iy1 < 0 ||
-      irx0 < 0 || itext < 0 ||
-      static_cast<size_t>(irx0) + 8 > header.size()) {
-    return;
-  }
-  for (const auto& row : data) {
-    if (!RowHasNumbers(row, header.size(),
-                       {ix0, iy0, ix1, iy1, irx0, irx0 + 1, irx0 + 2,
-                        irx0 + 3, irx0 + 4, irx0 + 5, irx0 + 6, irx0 + 7}) ||
-        !row[itext].is_string()) {
-      continue;
-    }
-    // Widget cells re-enter through the form-field family.
-    if (iwidget >= 0 && row[iwidget].is_boolean() && row[iwidget].get<bool>()) {
-      continue;
-    }
-    auto* cell = chunk->add_text_cells();
-    cell->set_text(row[itext].get<std::string>());
-    auto* bbox = cell->mutable_bbox();
-    bbox->set_x0(row[ix0].get<double>() + offset.dx);
-    bbox->set_y0(row[iy0].get<double>() + offset.dy);
-    bbox->set_x1(row[ix1].get<double>() + offset.dx);
-    bbox->set_y1(row[iy1].get<double>() + offset.dy);
-    auto* quad = cell->mutable_quad();
-    quad->set_x0(row[irx0 + 0].get<double>() + offset.dx);
-    quad->set_y0(row[irx0 + 1].get<double>() + offset.dy);
-    quad->set_x1(row[irx0 + 2].get<double>() + offset.dx);
-    quad->set_y1(row[irx0 + 3].get<double>() + offset.dy);
-    quad->set_x2(row[irx0 + 4].get<double>() + offset.dx);
-    quad->set_y2(row[irx0 + 5].get<double>() + offset.dy);
-    quad->set_x3(row[irx0 + 6].get<double>() + offset.dx);
-    quad->set_y3(row[irx0 + 7].get<double>() + offset.dy);
-    if (iltr >= 0 && row[iltr].is_boolean()) {
-      cell->set_direction(row[iltr].get<bool>()
-                              ? pdfv1::TEXT_DIRECTION_LEFT_TO_RIGHT
-                              : pdfv1::TEXT_DIRECTION_RIGHT_TO_LEFT);
-    }
-    if (ispace >= 0 && row[ispace].is_number()) {
-      cell->set_space_width(row[ispace].get<double>());
-    }
-    if (imode >= 0 && row[imode].is_number_integer()) {
-      const auto mode = row[imode].get<int64_t>();
-      if (mode >= 0 && mode <= 7) {
-        cell->set_rendering_mode(
-            static_cast<pdfv1::TextRenderingMode>(mode + 1));
-      }
-    }
-    if (ifont >= 0 && row[ifont].is_string()) {
-      const std::string& name = row[ifont].get_ref<const std::string&>();
-      const std::string key = ifontkey >= 0 && row[ifontkey].is_string()
-                                  ? row[ifontkey].get<std::string>()
-                                  : std::string();
-      cell->set_font_id(fonts->Intern(name, page_fonts.ProgramOf(key, name),
-                                      page_fonts.Embedded(key, name),
-                                      new_fonts));
-    }
-    ++*cell_count;
-  }
-}
-
-void FillShapes(const nlohmann::json& shapes, const PageSpaceOffset& offset,
-                pdfv1::PageChunk* chunk) {
-  if (!shapes.is_array()) return;
-  for (const auto& s : shapes) {
-    if (!s.contains("x") || !s.contains("y")) continue;
-    const auto& xs = s["x"];
-    const auto& ys = s["y"];
-    if (!xs.is_array() || !ys.is_array() || xs.size() != ys.size() ||
-        xs.empty()) {
-      continue;
-    }
-    bool numeric = true;
-    for (size_t i = 0; i < xs.size(); ++i) {
-      numeric = numeric && xs[i].is_number() && ys[i].is_number();
-    }
-    if (!numeric) continue;
-    auto* shape = chunk->add_shapes();
-    double min_x = xs[0].get<double>() + offset.dx;
-    double min_y = ys[0].get<double>() + offset.dy;
-    double max_x = min_x;
-    double max_y = min_y;
-    for (size_t i = 0; i < xs.size(); ++i) {
-      double x = xs[i].get<double>() + offset.dx;
-      double y = ys[i].get<double>() + offset.dy;
-      min_x = std::min(min_x, x);
-      min_y = std::min(min_y, y);
-      max_x = std::max(max_x, x);
-      max_y = std::max(max_y, y);
-      auto* seg = shape->add_segments();
-      pdfv1::PathPoint* point =
-          i == 0 ? seg->mutable_move_to() : seg->mutable_line_to();
-      point->set_x(x);
-      point->set_y(y);
-    }
-    // closing-type 2 marks an explicitly closed subpath in the engine's
-    // sampled polyline representation.
-    if (static_cast<int>(NumberOr(s, "closing-type", 0)) == 2) {
-      shape->add_segments()->set_close(true);
-    }
-    auto* box = shape->mutable_bbox();
-    box->set_x0(min_x);
-    box->set_y0(min_y);
-    box->set_x1(max_x);
-    box->set_y1(max_y);
-    if (s.contains("line-width") && s["line-width"].is_number()) {
-      shape->set_line_width(s["line-width"].get<double>());
-    }
-    auto fill_color = [](const nlohmann::json& rgb, pdfv1::Color* color) {
-      if (!rgb.is_array() || rgb.size() != 3 || !rgb[0].is_number() ||
-          !rgb[1].is_number() || !rgb[2].is_number()) {
-        return;
-      }
-      color->set_red(rgb[0].get<double>() / 255.0);
-      color->set_green(rgb[1].get<double>() / 255.0);
-      color->set_blue(rgb[2].get<double>() / 255.0);
-      color->set_alpha(1.0);
-    };
-    if (s.contains("rgb-filling")) {
-      fill_color(s["rgb-filling"], shape->mutable_fill_color());
-    }
-    if (s.contains("rgb-stroking")) {
-      fill_color(s["rgb-stroking"], shape->mutable_stroke_color());
-    }
-  }
-}
-
-void FillImages(const nlohmann::json& images, const PageSpaceOffset& offset,
-                pdfv1::PageChunk* chunk) {
-  if (!images.contains("header") || !images.contains("data")) return;
-  const auto& header = images["header"];
-  const auto& data = images["data"];
-  const int ix0 = ColumnIndex(header, "x0");
-  const int ikey = ColumnIndex(header, "xobject_key");
-  const int iw = ColumnIndex(header, "image_width");
-  const int ih = ColumnIndex(header, "image_height");
-  const int ibpc = ColumnIndex(header, "bits_per_component");
-  const int ics = ColumnIndex(header, "color_space");
-  if (!data.is_array() || ix0 < 0 ||
-      static_cast<size_t>(ix0) + 4 > header.size()) {
-    return;
-  }
-  for (const auto& row : data) {
-    if (!RowHasNumbers(row, header.size(), {ix0, ix0 + 1, ix0 + 2, ix0 + 3})) {
-      continue;
-    }
-    auto* image = chunk->add_images();
-    auto* bbox = image->mutable_bbox();
-    bbox->set_x0(row[ix0 + 0].get<double>() + offset.dx);
-    bbox->set_y0(row[ix0 + 1].get<double>() + offset.dy);
-    bbox->set_x1(row[ix0 + 2].get<double>() + offset.dx);
-    bbox->set_y1(row[ix0 + 3].get<double>() + offset.dy);
-    auto* quad = image->mutable_quad();
-    quad->set_x0(bbox->x0());
-    quad->set_y0(bbox->y0());
-    quad->set_x1(bbox->x1());
-    quad->set_y1(bbox->y0());
-    quad->set_x2(bbox->x1());
-    quad->set_y2(bbox->y1());
-    quad->set_x3(bbox->x0());
-    quad->set_y3(bbox->y1());
-    if (iw >= 0) {
-      if (auto width = UInt32Of(row[iw])) image->set_source_width_px(*width);
-    }
-    if (ih >= 0) {
-      if (auto height = UInt32Of(row[ih])) image->set_source_height_px(*height);
-    }
-    if (ibpc >= 0) {
-      if (auto bits = UInt32Of(row[ibpc])) image->set_bits_per_component(*bits);
-    }
-    if (ics >= 0 && row[ics].is_string()) {
-      std::string cs = row[ics].get<std::string>();
-      if (!cs.empty() && cs.front() == '/') cs.erase(0, 1);
-      if (!cs.empty()) image->set_colorspace(cs);
-    }
-    if (ikey >= 0 && row[ikey].is_string()) {
-      std::string key = row[ikey].get<std::string>();
-      if (!key.empty() && key.front() == '/') key.erase(0, 1);
-      if (!key.empty()) image->set_resource_name(key);
-    }
-  }
-}
-
-void FillHyperlinks(const nlohmann::json& links, const PageSpaceOffset& offset,
-                    pdfv1::PageChunk* chunk) {
-  if (!links.is_array()) return;
-  for (const auto& l : links) {
-    // The engine reports every /A link and leaves uri empty for actions
-    // other than /URI (GoTo and the rest). The contract types an internal
-    // link as a destination, which the engine does not resolve, and a link
-    // it cannot type is not emitted.
-    const std::string uri = StringOr(l, "uri");
-    if (uri.empty()) continue;
-    auto* link = chunk->add_hyperlinks();
-    link->set_uri(uri);
-    // The link /Rect as stored, moved into the cells' frame.
-    SetBox(NumberOr(l, "x0", 0.0) + offset.dx,
-           NumberOr(l, "y0", 0.0) + offset.dy,
-           NumberOr(l, "x1", 0.0) + offset.dx,
-           NumberOr(l, "y1", 0.0) + offset.dy, link->mutable_bbox());
-  }
-}
-
-// ISO 32000-1 field flag bits (table 221, 226, 228); bit n of the spec is
-// 1 << (n - 1).
-constexpr uint32_t kFieldFlagReadOnly = 1u << 0;
-constexpr uint32_t kFieldFlagRadio = 1u << 15;
-constexpr uint32_t kFieldFlagPushButton = 1u << 16;
-constexpr uint32_t kFieldFlagCombo = 1u << 17;
-
-// The typed kind from the inherited /FT and /Ff: /Btn and /Ch each cover
-// several kinds that only the flags tell apart.
-pdfv1::FormFieldKind FieldKind(const std::string& type, uint32_t flags) {
-  if (type == "/Tx") return pdfv1::FORM_FIELD_KIND_TEXT;
-  if (type == "/Sig") return pdfv1::FORM_FIELD_KIND_SIGNATURE;
-  if (type == "/Btn") {
-    if (flags & kFieldFlagPushButton) return pdfv1::FORM_FIELD_KIND_PUSH_BUTTON;
-    if (flags & kFieldFlagRadio) return pdfv1::FORM_FIELD_KIND_RADIO_BUTTON;
-    return pdfv1::FORM_FIELD_KIND_CHECK_BOX;
-  }
-  if (type == "/Ch") {
-    return (flags & kFieldFlagCombo) ? pdfv1::FORM_FIELD_KIND_COMBO_BOX
-                                     : pdfv1::FORM_FIELD_KIND_LIST_BOX;
-  }
-  return pdfv1::FORM_FIELD_KIND_UNSPECIFIED;
-}
-
-// One FormField per widget the engine reports. The engine resolves the
-// field type, /Ff and /TU through the /Parent chain (qpdf's form field
-// helper) and reads /AS from the widget itself, the same raw state
-// docling-core exposes as PdfWidget.widget_field_flags and
-// widget_appearance_state.
-void FillFormFields(const nlohmann::json& widgets,
-                    const PageSpaceOffset& offset, pdfv1::PageChunk* chunk) {
-  if (!widgets.is_array()) return;
-  for (const auto& w : widgets) {
-    if (!w.is_object()) continue;
-    auto* field = chunk->add_form_fields();
-    const std::string type = StringOr(w, "field_type");
-    uint32_t flags = 0;
-    if (w.contains("field_flags") && w["field_flags"].is_number_integer()) {
-      flags = static_cast<uint32_t>(w["field_flags"].get<int64_t>());
-      field->set_flags(flags);
-      field->set_read_only((flags & kFieldFlagReadOnly) != 0);
-    }
-    const pdfv1::FormFieldKind kind = FieldKind(type, flags);
-    field->set_kind(kind);
-    field->set_name(StringOr(w, "field_name"));
-    std::string value = StringOr(w, "text");
-    // A button's /V is a name, which the engine spells with its slash;
-    // the other backends (PDFium, poppler) report the bare state name, so
-    // this one does too.
-    if ((kind == pdfv1::FORM_FIELD_KIND_CHECK_BOX ||
-         kind == pdfv1::FORM_FIELD_KIND_RADIO_BUTTON) &&
-        value.starts_with('/')) {
-      value.erase(0, 1);
-    }
-    if (!value.empty()) field->set_value(value);
-    std::string desc = StringOr(w, "description");
-    if (!desc.empty()) field->set_alternate_name(desc);
-    std::string state = StringOr(w, "appearance_state");
-    if (!state.empty()) field->set_appearance_state(state);
-    // The widget /Rect as stored, moved into the cells' frame.
-    SetBox(NumberOr(w, "x0", 0.0) + offset.dx,
-           NumberOr(w, "y0", 0.0) + offset.dy,
-           NumberOr(w, "x1", 0.0) + offset.dx,
-           NumberOr(w, "y1", 0.0) + offset.dy, field->mutable_rect());
-  }
-}
-
-void FillOutlineNode(const nlohmann::json& entry, pdfv1::OutlineNode* node) {
-  node->set_title(StringOr(entry, "title"));
-  if (entry.contains("children") && entry["children"].is_array()) {
-    for (const auto& child : entry["children"]) {
-      FillOutlineNode(child, node->add_children());
-    }
-  }
-}
 
 pdfv1::FontProgramFormat ProgramFormat(pdflib::embedded_font_format format) {
   switch (format) {
@@ -1350,7 +1227,8 @@ void CollectPrograms(const PageFonts& page_fonts, FontInterner* fonts,
   for (const auto& [key, program] : page_fonts.fonts()) {
     if (program == nullptr || !program->has_bytes()) continue;
     const uint32_t id =
-        fonts->Intern(key.second, program, /*embedded=*/true, new_fonts);
+        fonts->Intern(page_fonts.WrittenName(key.first, key.second), program,
+                      /*embedded=*/true, new_fonts);
     if (!sent->insert(id).second) continue;
     pdfv1::EmbeddedFont font;
     font.set_font_id(id);
@@ -1577,8 +1455,7 @@ bool WantPageItems(const pdfv1::ParseRequest& request) {
   for (pdfv1::PdfFamily family :
        {pdfv1::PDF_FAMILY_TEXT_CELLS, pdfv1::PDF_FAMILY_FONTS,
         pdfv1::PDF_FAMILY_EMBEDDED_FONTS, pdfv1::PDF_FAMILY_PLACED_IMAGES,
-        pdfv1::PDF_FAMILY_VECTOR_SHAPES, pdfv1::PDF_FAMILY_HYPERLINKS,
-        pdfv1::PDF_FAMILY_FORM_FIELDS}) {
+        pdfv1::PDF_FAMILY_VECTOR_SHAPES}) {
     if (WantFamily(request, family)) return true;
   }
   return false;
@@ -1688,10 +1565,54 @@ grpc::Status RasterizePage(pdflib::pdf_decoder<pdflib::PAGE>& decoder,
 }
 
 void AddPageWarning(pdfv1::ParseTrailer* trailer, int page_index,
-                    const std::string& message) {
+                    const std::string& message,
+                    std::optional<pdfv1::PdfFamily> family = std::nullopt) {
   auto* warning = trailer->add_warnings();
   warning->set_page_index(static_cast<uint32_t>(page_index));
+  if (family.has_value()) warning->set_family(*family);
   warning->set_message(message);
+}
+
+// What a page with no usable /MediaBox is told, in Parse and in Render.
+constexpr char kGuessedMediaBox[] =
+    "the page stores no usable /MediaBox; it is sized as US Letter (612 x 792 "
+    "points), and its geometry is relative to that guess";
+
+// The most pages a Parse lists one by one for a fault every page of a
+// damaged document can share; the rest are counted.
+constexpr int kMaxPagesListed = 16;
+
+// What the link reader left out of a page, as warnings on that page.
+void AddLinkWarnings(const LinksRead& read, int page_index,
+                     pdfv1::ParseTrailer* trailer) {
+  if (read.without_rect > 0) {
+    AddPageWarning(trailer, page_index,
+                   std::to_string(read.without_rect) +
+                       " link(s) have no usable /Rect; each is listed with "
+                       "no bbox",
+                   pdfv1::PDF_FAMILY_HYPERLINKS);
+  }
+  if (read.unresolved > 0) {
+    AddPageWarning(trailer, page_index,
+                   std::to_string(read.unresolved) +
+                       " link(s) point at a page the document does not hold "
+                       "and are not listed",
+                   pdfv1::PDF_FAMILY_HYPERLINKS);
+  }
+  if (!read.untyped.empty()) {
+    uint64_t total = 0;
+    std::string kinds;
+    for (const auto& [action, count] : read.untyped) {
+      total += count;
+      if (!kinds.empty()) kinds += ", ";
+      kinds += PrintableAscii(action, 48);
+    }
+    AddPageWarning(trailer, page_index,
+                   std::to_string(total) +
+                       " link(s) are not listed: their action (" + kinds +
+                       ") is neither a URI nor a go-to within the document",
+                   pdfv1::PDF_FAMILY_HYPERLINKS);
+  }
 }
 
 // The most different qpdf warnings one page, or the document's load, puts
@@ -1702,14 +1623,28 @@ constexpr size_t kMaxQpdfWarnings = 16;
 // Adds what qpdf said to the trailer's warnings: about the page given, or
 // with no page about the document as a whole. A warning qpdf repeats (it
 // says it again each time it reads the object) is added once.
+using WarningList = google::protobuf::RepeatedPtrField<pdfv1::ParseWarning>;
+
+void AddQpdfWarnings(const std::vector<QPDFExc>& said,
+                     std::optional<int> page_index, WarningList* warnings,
+                     std::optional<pdfv1::PdfFamily> family = std::nullopt);
+
+// The Parse form: into the trailer.
 void AddQpdfWarnings(const std::vector<QPDFExc>& said,
                      std::optional<int> page_index,
                      pdfv1::ParseTrailer* trailer) {
+  AddQpdfWarnings(said, page_index, trailer->mutable_warnings());
+}
+
+void AddQpdfWarnings(const std::vector<QPDFExc>& said,
+                     std::optional<int> page_index, WarningList* warnings,
+                     std::optional<pdfv1::PdfFamily> family) {
   auto add = [&](std::string message) {
-    auto* warning = trailer->add_warnings();
+    auto* warning = warnings->Add();
     if (page_index.has_value()) {
       warning->set_page_index(static_cast<uint32_t>(*page_index));
     }
+    if (family.has_value()) warning->set_family(*family);
     warning->set_message(std::move(message));
   };
   std::set<std::string> listed;
@@ -1728,6 +1663,14 @@ void AddQpdfWarnings(const std::vector<QPDFExc>& said,
     add("qpdf: " + std::to_string(unlisted) + " more warning(s) here, past the " +
         std::to_string(kMaxQpdfWarnings) + " listed");
   }
+}
+
+// Writes a message once its strings are valid UTF-8 (valid_utf8.h); every
+// message of a Parse or Render answer leaves through here.
+template <typename Message>
+bool Send(MessageSink<Message>* writer, Message* message) {
+  MakeStringsValidUtf8(message);
+  return writer->Write(*message);
 }
 
 }  // namespace
@@ -1794,6 +1737,7 @@ grpc::Status QparseServiceImpl::Probe(grpc::ServerContext* /*context*/,
       break;
   }
   FillCapabilities(loaded, response->mutable_capabilities());
+  MakeStringsValidUtf8(response);
   return grpc::Status::OK;
 }
 
@@ -1838,7 +1782,7 @@ grpc::Status QparseServiceImpl::ParseTo(
   for (int i = 0; i < page_count; ++i) {
     FillPageInfo(loaded.pages->geometry(i), i, header->add_pages());
   }
-  if (!writer->Write(header_msg) || loaded.status != pdfv1::LOAD_STATUS_OK) {
+  if (!Send(writer, &header_msg) || loaded.status != pdfv1::LOAD_STATUS_OK) {
     return grpc::Status::OK;
   }
 
@@ -1859,6 +1803,22 @@ grpc::Status QparseServiceImpl::ParseTo(
                          " page(s), " + std::to_string(page_count) +
                          " could be read");
   }
+  // The inventory is the whole document's, so these are too.
+  int guessed_boxes = 0;
+  for (int i = 0; i < page_count; ++i) {
+    if (!loaded.pages->geometry(i).media_box_guessed) continue;
+    if (++guessed_boxes <= kMaxPagesListed) {
+      AddPageWarning(trailer, i, kGuessedMediaBox,
+                     pdfv1::PDF_FAMILY_PAGE_INVENTORY);
+    }
+  }
+  if (guessed_boxes > kMaxPagesListed) {
+    auto* warning = trailer->add_warnings();
+    warning->set_family(pdfv1::PDF_FAMILY_PAGE_INVENTORY);
+    warning->set_message(std::to_string(guessed_boxes - kMaxPagesListed) +
+                         " more page(s) store no usable /MediaBox, past the " +
+                         std::to_string(kMaxPagesListed) + " listed");
+  }
 
   // Document-level families.
   if (WantFamily(*request, pdfv1::PDF_FAMILY_DOC_METADATA)) {
@@ -1878,25 +1838,40 @@ grpc::Status QparseServiceImpl::ParseTo(
       meta->set_xmp_xml(xmp.get<std::string>());
     }
     ++counts[pdfv1::PDF_FAMILY_DOC_METADATA];
-    client_ok = writer->Write(msg);
+    client_ok = Send(writer, &msg);
   }
-  if (client_ok && WantFamily(*request, pdfv1::PDF_FAMILY_OUTLINE)) {
-    nlohmann::json toc = loaded.doc->get_table_of_contents();
-    if (toc.is_object() && toc.contains("children")) {
-      pdfv1::ParseResponse msg;
-      auto* chunk = msg.mutable_outline();
-      for (const auto& child : toc["children"]) {
-        FillOutlineNode(child, chunk->add_roots());
+  if (client_ok && WantFamily(*request, pdfv1::PDF_FAMILY_OUTLINE) &&
+      loaded.pages->HasOutline()) {
+    pdfv1::ParseResponse msg;
+    try {
+      const OutlineRead read = loaded.pages->ReadOutline(msg.mutable_outline());
+      counts[pdfv1::PDF_FAMILY_OUTLINE] = read.items;
+      if (read.unresolved > 0) {
+        auto* warning = trailer->add_warnings();
+        warning->set_family(pdfv1::PDF_FAMILY_OUTLINE);
+        warning->set_message(
+            std::to_string(read.unresolved) +
+            " outline item(s) point at a page the document does not hold; "
+            "each keeps its title and has no destination");
       }
-      client_ok = writer->Write(msg);
-    } else if (toc.is_array() && !toc.empty()) {
-      pdfv1::ParseResponse msg;
-      auto* chunk = msg.mutable_outline();
-      for (const auto& entry : toc) {
-        FillOutlineNode(entry, chunk->add_roots());
+      if (read.cut > 0) {
+        auto* warning = trailer->add_warnings();
+        warning->set_family(pdfv1::PDF_FAMILY_OUTLINE);
+        warning->set_message(
+            std::to_string(read.cut) + " outline item(s) lie below level " +
+            std::to_string(kMaxOutlineLevels) +
+            ", the deepest this service follows; they and every item under "
+            "them are left out");
       }
-      client_ok = writer->Write(msg);
+      if (msg.outline().roots_size() > 0) client_ok = Send(writer, &msg);
+    } catch (const std::exception& e) {
+      auto* warning = trailer->add_warnings();
+      warning->set_family(pdfv1::PDF_FAMILY_OUTLINE);
+      warning->set_message("the outline could not be read and is left out: " +
+                           PrintableAscii(e.what(), 256));
     }
+    // What qpdf said while the outline's objects were read.
+    AddQpdfWarnings(loaded.pages->TakeWarnings(), std::nullopt, trailer);
   }
 
   const PageSpan span =
@@ -1907,6 +1882,8 @@ grpc::Status QparseServiceImpl::ParseTo(
       WantFamily(*request, pdfv1::PDF_FAMILY_EMBEDDED_FONTS);
   const pdflib::decode_config config = ParseDecodeConfig(want_programs);
   const bool want_page_items = WantPageItems(*request);
+  const bool want_links = WantFamily(*request, pdfv1::PDF_FAMILY_HYPERLINKS);
+  const bool want_fields = WantFamily(*request, pdfv1::PDF_FAMILY_FORM_FIELDS);
   FontInterner fonts;
   std::set<uint32_t> programs_sent;
   for (int i = span.begin; client_ok && i < span.end; ++i) {
@@ -1921,6 +1898,40 @@ grpc::Status QparseServiceImpl::ParseTo(
     pdfv1::FontTableChunk new_fonts;
     std::vector<pdfv1::EmbeddedFont> embedded;
     uint64_t page_cells = 0;
+    bool content_skipped = false;
+
+    // Links and form fields come from the page's annotations, not from the
+    // engine's decode of its content, so a page the engine cannot decode
+    // still has them.
+    if (want_links) {
+      try {
+        AddLinkWarnings(loaded.pages->ReadLinks(i, chunk), i, trailer);
+      } catch (const std::exception& e) {
+        chunk->clear_hyperlinks();
+        AddPageWarning(trailer, i,
+                       "the page's links could not be read and are left out: " +
+                           PrintableAscii(e.what(), 256),
+                       pdfv1::PDF_FAMILY_HYPERLINKS);
+      }
+    }
+    if (want_fields) {
+      try {
+        const FieldsRead read = loaded.pages->ReadFormFields(i, chunk);
+        if (read.without_rect > 0) {
+          AddPageWarning(trailer, i,
+                         std::to_string(read.without_rect) +
+                             " form field widget(s) have no usable /Rect; "
+                             "each is listed with no rect",
+                         pdfv1::PDF_FAMILY_FORM_FIELDS);
+        }
+      } catch (const std::exception& e) {
+        chunk->clear_form_fields();
+        AddPageWarning(trailer, i,
+                       "the page's form fields could not be read and are left "
+                       "out: " + PrintableAscii(e.what(), 256),
+                       pdfv1::PDF_FAMILY_FORM_FIELDS);
+      }
+    }
 
     if (want_page_items) {
       // A content stream that does not decode leaves the engine with an
@@ -1943,43 +1954,63 @@ grpc::Status QparseServiceImpl::ParseTo(
         const std::array<double, 4>& crop =
             loaded.pages->geometry(i).crop_box;
         const PageSpaceOffset offset{media[0] - crop[0], media[1] - crop[1]};
-        const PageSpaceOffset stored_offset{-crop[0], -crop[1]};
 
         // Which program each of the page's fonts draws with, so a cell and
         // its program get the same font id, and which fonts embed one.
-        PageFonts page_fonts(loaded.pages->EmbeddedFonts(i));
+        PageFonts page_fonts(loaded.pages->Fonts(i));
         if (want_fonts || want_programs) {
           decoder->get_instructions().iterate_over_instructions(page_fonts);
         }
 
+        // The engine writes all three for every decoded page, empty when
+        // the page has none; one that is missing, or not in the shape this
+        // build reads, fails the page (engine_tables.h). A row that does
+        // not fit is left out and counted.
         const auto& sanitized = pj.contains("sanitized") ? pj["sanitized"] : pj;
-        const auto& original = pj.contains("original") ? pj["original"] : pj;
-        if (WantFamily(*request, pdfv1::PDF_FAMILY_TEXT_CELLS) &&
-            sanitized.contains("cells")) {
-          FillTextCells(sanitized["cells"], offset, page_fonts, &fonts, chunk,
-                        &new_fonts, &page_cells);
+        auto entry = [&sanitized](const char* key) -> const nlohmann::json& {
+          auto it = sanitized.find(key);
+          if (it == sanitized.end()) {
+            throw EngineShapeError(
+                std::string("the engine's page output has no \"") + key +
+                "\" entry");
+          }
+          return *it;
+        };
+        auto said_skipped = [trailer, i](const TableRead& read,
+                                         pdfv1::PdfFamily family,
+                                         const char* what) {
+          if (read.skipped == 0) return;
+          AddPageWarning(trailer, i,
+                         std::to_string(read.skipped) + " " + what +
+                             " in the engine's output are not in the shape "
+                             "this build reads and are left out",
+                         family);
+        };
+        if (WantFamily(*request, pdfv1::PDF_FAMILY_TEXT_CELLS)) {
+          const TableRead read = FillTextCells(
+              entry("cells"), offset,
+              [&](const std::string& key, const std::string& name) {
+                return fonts.Intern(page_fonts.WrittenName(key, name),
+                                    page_fonts.ProgramOf(key, name),
+                                    page_fonts.Embedded(key, name), &new_fonts);
+              },
+              chunk);
+          page_cells = read.items;
+          said_skipped(read, pdfv1::PDF_FAMILY_TEXT_CELLS, "text cell row(s)");
         }
-        if (WantFamily(*request, pdfv1::PDF_FAMILY_VECTOR_SHAPES) &&
-            sanitized.contains("shapes")) {
-          FillShapes(sanitized["shapes"], offset, chunk);
+        if (WantFamily(*request, pdfv1::PDF_FAMILY_VECTOR_SHAPES)) {
+          said_skipped(FillShapes(entry("shapes"), offset, chunk),
+                       pdfv1::PDF_FAMILY_VECTOR_SHAPES, "shape(s)");
         }
-        if (WantFamily(*request, pdfv1::PDF_FAMILY_PLACED_IMAGES) &&
-            sanitized.contains("images")) {
-          FillImages(sanitized["images"], offset, chunk);
-        }
-        if (WantFamily(*request, pdfv1::PDF_FAMILY_HYPERLINKS) &&
-            original.contains("hyperlinks")) {
-          FillHyperlinks(original["hyperlinks"], stored_offset, chunk);
-        }
-        if (WantFamily(*request, pdfv1::PDF_FAMILY_FORM_FIELDS) &&
-            original.contains("widgets")) {
-          FillFormFields(original["widgets"], stored_offset, chunk);
+        if (WantFamily(*request, pdfv1::PDF_FAMILY_PLACED_IMAGES)) {
+          said_skipped(FillImages(entry("images"), offset, chunk),
+                       pdfv1::PDF_FAMILY_PLACED_IMAGES, "image row(s)");
         }
         // The font table lists every font the page draws with, cells
         // requested or not; programs go only to a call that asked for them.
         if (want_fonts) {
           for (const auto& [key, program] : page_fonts.fonts()) {
-            fonts.Intern(key.second, program,
+            fonts.Intern(page_fonts.WrittenName(key.first, key.second), program,
                          page_fonts.Embedded(key.first, key.second),
                          &new_fonts);
           }
@@ -1989,25 +2020,24 @@ grpc::Status QparseServiceImpl::ParseTo(
                           &embedded);
         }
       } catch (const std::exception& e) {
-        // The page is skipped, and said so in the trailer. Font ids it
-        // already took are still announced, so later pages that share a
-        // font never point at an entry the client has not seen.
+        // The page's content is skipped, and said so in the trailer: what
+        // the engine had given of it so far is taken back, so no half-read
+        // page goes out as a page. Font ids it already took are still
+        // announced, so later pages that share a font never point at an
+        // entry the client has not seen.
         AddPageWarning(trailer, i,
                        std::string("page skipped: ") + e.what());
-        AddQpdfWarnings(loaded.pages->TakeWarnings(), i, trailer);
-        if (new_fonts.fonts_size() > 0) {
-          counts[pdfv1::PDF_FAMILY_FONTS] +=
-              static_cast<uint64_t>(new_fonts.fonts_size());
-          pdfv1::ParseResponse fonts_msg;
-          *fonts_msg.mutable_fonts() = new_fonts;
-          client_ok = writer->Write(fonts_msg);
-        }
-        continue;
+        chunk->clear_text_cells();
+        chunk->clear_shapes();
+        chunk->clear_images();
+        embedded.clear();
+        page_cells = 0;
+        content_skipped = true;
       }
-      // What qpdf said while the engine read the page: a stream it could
-      // not decode, an object it had to repair.
-      AddQpdfWarnings(loaded.pages->TakeWarnings(), i, trailer);
     }
+    // What qpdf said while the page was read: a stream it could not decode,
+    // an object it had to repair.
+    AddQpdfWarnings(loaded.pages->TakePageWarnings(i), i, trailer);
 
     counts[pdfv1::PDF_FAMILY_TEXT_CELLS] += page_cells;
     counts[pdfv1::PDF_FAMILY_PLACED_IMAGES] += chunk->images_size();
@@ -2019,26 +2049,44 @@ grpc::Status QparseServiceImpl::ParseTo(
           static_cast<uint64_t>(new_fonts.fonts_size());
       pdfv1::ParseResponse fonts_msg;
       *fonts_msg.mutable_fonts() = new_fonts;
-      client_ok = writer->Write(fonts_msg);
+      client_ok = Send(writer, &fonts_msg);
       if (!client_ok) break;
     }
-    client_ok = writer->Write(page_msg);
+    // A page whose content was skipped has a chunk only for what was read
+    // without the engine, its links and form fields.
+    if (content_skipped && chunk->hyperlinks_size() == 0 &&
+        chunk->form_fields_size() == 0) {
+      continue;
+    }
+    client_ok = Send(writer, &page_msg);
     for (auto& program : embedded) {
       if (!client_ok) break;
       pdfv1::ParseResponse font_msg;
       *font_msg.mutable_embedded_font() = std::move(program);
       ++counts[pdfv1::PDF_FAMILY_EMBEDDED_FONTS];
-      client_ok = writer->Write(font_msg);
+      client_ok = Send(writer, &font_msg);
     }
   }
   if (!client_ok) return grpc::Status::OK;
+
+  if (const auto images = counts.find(pdfv1::PDF_FAMILY_PLACED_IMAGES);
+      request->options().include_image_data() && images != counts.end() &&
+      images->second > 0) {
+    auto* warning = trailer->add_warnings();
+    warning->set_family(pdfv1::PDF_FAMILY_PLACED_IMAGES);
+    warning->set_message(
+        "include_image_data is not served by this backend: the " +
+        std::to_string(images->second) +
+        " placed image(s) are listed with their placement and declared size "
+        "and carry no image samples");
+  }
 
   for (const auto& [family, count] : counts) {
     auto* entry = trailer->add_counts();
     entry->set_family(family);
     entry->set_count(count);
   }
-  writer->Write(trailer_msg);
+  Send(writer, &trailer_msg);
   return grpc::Status::OK;
 }
 
@@ -2090,7 +2138,7 @@ grpc::Status QparseServiceImpl::RenderTo(
     auto* head = head_msg.mutable_head();
     head->set_load_status(loaded.status);
     if (!loaded.detail.empty()) head->set_load_detail(loaded.detail);
-    writer->Write(head_msg);
+    Send(writer, &head_msg);
     return grpc::Status::OK;
   }
 
@@ -2137,9 +2185,9 @@ grpc::Status QparseServiceImpl::RenderTo(
       return RenderPageFailure(
           i, std::string("the engine could not decode it: ") + e.what());
     }
-    // The Render stream has no place for them yet; taking them keeps the
-    // handle from holding every page's warnings to the end of the call.
-    loaded.pages->TakeWarnings();
+    // What qpdf said while the engine read the page rides beside the
+    // page's raster.
+    const std::vector<QPDFExc> said = loaded.pages->TakePageWarnings(i);
     // An image over the pixel budget was never decoded. A page that draws
     // one is not rendered without it; a page that only shares a resource
     // dictionary with it is.
@@ -2165,7 +2213,30 @@ grpc::Status QparseServiceImpl::RenderTo(
       ReleasePooledCanvas();
     }
     if (!rendered.ok()) return rendered;
-    if (!writer->Write(msg)) return grpc::Status::OK;
+    // The raster is there and is not the whole page: said beside it.
+    auto warn = [&msg, i](std::string message) {
+      auto* warning = msg.add_warnings();
+      warning->set_page_index(static_cast<uint32_t>(i));
+      warning->set_family(pdfv1::PDF_FAMILY_PAGE_RASTER);
+      warning->set_message(std::move(message));
+    };
+    if (geometry.media_box_guessed) warn(kGuessedMediaBox);
+    ImagesWithoutSamples missing;
+    decoder->get_instructions().iterate_over_instructions(missing);
+    if (missing.count() > 0) {
+      std::string names;
+      for (const std::string& name : missing.names()) {
+        if (!names.empty()) names += ", ";
+        names += name;
+      }
+      warn(std::to_string(missing.count()) +
+           " image(s) the page draws are missing from the raster: their "
+           "samples did not decode" +
+           (names.empty() ? std::string() : " (" + names + ")"));
+    }
+    AddQpdfWarnings(said, i, msg.mutable_warnings(),
+                    pdfv1::PDF_FAMILY_PAGE_RASTER);
+    if (!Send(writer, &msg)) return grpc::Status::OK;
   }
   return grpc::Status::OK;
 }
