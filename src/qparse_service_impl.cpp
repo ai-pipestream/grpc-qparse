@@ -1381,16 +1381,33 @@ grpc::Status CheckRasterSizes(const DocumentPages& pages, PageSpan span,
   return grpc::Status::OK;
 }
 
+// The status a Render call ends with at a page it cannot produce. The
+// contract has no per-page message on the Render stream, so the page index
+// and the reason ride in the status (RequestDone.detail over ParseStream),
+// and the same line goes to the log. The reason is the engine's exception
+// text: it is cut to a length a status trailer carries and held to
+// printable ASCII, because it ends up in a proto string.
+grpc::Status RenderPageFailure(int index, const std::string& reason) {
+  constexpr size_t kMaxReasonBytes = 256;
+  std::string text = reason.substr(0, kMaxReasonBytes);
+  for (char& c : text) {
+    if (c < 0x20 || c > 0x7e) c = '?';
+  }
+  const std::string message =
+      "Render failed on page " + std::to_string(index) + ": " + text;
+  LOG_S(ERROR) << message;
+  return grpc::Status(grpc::StatusCode::INTERNAL, message);
+}
+
 // Rasterizes one decoded page into msg's raster, over the request's
 // background. A page the rasterizer throws on, or that leaves no canvas of
-// its size, is logged and reported false, so the call skips it the way it
-// skips a page the engine cannot decode; the rest of the range still
-// renders.
-bool RasterizePage(pdflib::pdf_decoder<pdflib::PAGE>& decoder, int index,
-                   const PageGeometry& geometry,
-                   const pdflib::render_config& render_cfg,
-                   const pdfv1::RenderRequest& request,
-                   pdfv1::RenderResponse* msg) {
+// its size, is a failure of the call, like a page the engine cannot
+// decode: the status says which page and why.
+grpc::Status RasterizePage(pdflib::pdf_decoder<pdflib::PAGE>& decoder,
+                           int index, const PageGeometry& geometry,
+                           const pdflib::render_config& render_cfg,
+                           const pdfv1::RenderRequest& request,
+                           pdfv1::RenderResponse* msg) {
   pdflib::size_instruction size = SizeInstruction(geometry);
   decoder.get_instructions().add_size_instruction(size);
   try {
@@ -1403,19 +1420,17 @@ bool RasterizePage(pdflib::pdf_decoder<pdflib::PAGE>& decoder, int index,
     const auto width = static_cast<uint32_t>(shape[1]);
     if (canvas == nullptr || canvas->empty() ||
         canvas->size() != static_cast<size_t>(width) * height * 4) {
-      LOG_S(ERROR) << "Render skips page " << index
-                   << ": the rasterizer produced no canvas of its size";
-      return false;
+      return RenderPageFailure(
+          index, "the rasterizer produced no canvas of its size");
     }
     auto* raster = msg->mutable_raster();
     raster->set_page_index(static_cast<uint32_t>(index));
     raster->set_dpi(request.dpi());
     FillPixels(*canvas, width, height, request.pixel_format(), raster);
-    return true;
+    return grpc::Status::OK;
   } catch (const std::exception& e) {
-    LOG_S(ERROR) << "Render skips page " << index
-                 << ": the rasterizer failed on it: " << e.what();
-    return false;
+    return RenderPageFailure(
+        index, std::string("the rasterizer failed on it: ") + e.what());
   }
 }
 
@@ -1778,27 +1793,26 @@ grpc::Status QparseServiceImpl::RenderTo(
       return grpc::Status(grpc::StatusCode::CANCELLED,
                           "the call was cancelled");
     }
-    // The contract has no per-page warning on the Render stream, so a page
-    // left out of it is logged with its index and the reason.
+    // A page that cannot be decoded or rasterized fails the call there: an
+    // OK Render stream carries every page of its range.
     std::shared_ptr<pdflib::pdf_decoder<pdflib::PAGE>> decoder;
     try {
       ++decoded_pages_;
       decoder = loaded.pages->Decode(i, config, render_limits_.max_pixels,
                                      annotations);
     } catch (const std::exception& e) {
-      LOG_S(ERROR) << "Render skips page " << i
-                   << ": the engine could not decode it: " << e.what();
-      continue;
+      return RenderPageFailure(
+          i, std::string("the engine could not decode it: ") + e.what());
     }
     const PageGeometry& geometry = loaded.pages->geometry(i);
     pdfv1::RenderResponse msg;
-    const bool rendered =
+    const grpc::Status rendered =
         RasterizePage(*decoder, i, geometry, render_cfg, *request, &msg);
     const std::array<double, 2> raster_size = RasterSize(geometry, scale);
     if (raster_size[0] * raster_size[1] > kPooledCanvasPixels) {
       ReleasePooledCanvas();
     }
-    if (!rendered) continue;
+    if (!rendered.ok()) return rendered;
     if (!writer->Write(msg)) return grpc::Status::OK;
   }
   return grpc::Status::OK;

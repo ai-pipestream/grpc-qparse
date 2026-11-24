@@ -1745,20 +1745,84 @@ int main(int argc, char** argv) {
     }
     Check(warned, "the trailer names the skipped page");
 
-    // Render has no per-page warning in the contract: the page is left out
-    // of the stream and the log says which page and why.
+    // Render has no per-page message in the contract, so a page the engine
+    // cannot decode fails the call with a status that names it. Rasters
+    // stream in page order, so the pages before it have arrived; an OK
+    // stream always carries every page that was asked for.
     ErrorLog errors;
-    loguru::add_callback("render-skips", &ErrorLog::Collect, &errors,
+    loguru::add_callback("render-fails", &ErrorLog::Collect, &errors,
                          loguru::Verbosity_ERROR);
     grpc::Status status;
     std::vector<pdfv1::PageRaster> rasters = RenderDocument(
         stub.get(), broken, 36.0, pdfv1::PIXEL_FORMAT_RGBA8, std::nullopt,
         &status);
-    loguru::remove_callback("render-skips");
+    loguru::remove_callback("render-fails");
+    Check(status.error_code() == grpc::INTERNAL,
+          "Render over an undecodable page is INTERNAL, not OK");
+    Check(status.error_message().find("page 1") != std::string::npos,
+          "the Render status names the undecodable page");
+    Check(rasters.size() == 1 && rasters[0].page_index() == 0,
+          "the page before the undecodable one has streamed");
+    Check(errors.Contains("Render failed on page 1:"),
+          "the log names the page Render failed on");
+
+    // The undecodable page asked for alone: never an empty OK stream.
+    rasters = RenderDocument(stub.get(), broken, 36.0,
+                             pdfv1::PIXEL_FORMAT_RGBA8, std::make_pair(1u, 2u),
+                             &status);
+    Check(status.error_code() == grpc::INTERNAL && rasters.empty() &&
+              status.error_message().find("page 1") != std::string::npos,
+          "Render of the undecodable page alone is INTERNAL with no raster");
+
+    // The good page of the same file still renders on its own.
+    rasters = RenderDocument(stub.get(), broken, 36.0,
+                             pdfv1::PIXEL_FORMAT_RGBA8, std::make_pair(0u, 1u),
+                             &status);
     Check(status.ok() && rasters.size() == 1 && rasters[0].page_index() == 0,
-          "Render streams the good page without the undecodable one");
-    Check(errors.Contains("Render skips page 1:"),
-          "the log names the page Render skipped");
+          "the good page of a file with an undecodable page renders OK");
+
+    // The call stops at the page it fails on: with the undecodable page
+    // first, no later raster follows a failure the client has yet to read.
+    const std::string broken_first = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] "
+         "/Resources << /Font << /F1 7 0 R >> >> >>",
+         "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>",
+         "<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>",
+         Stream("BT /F1 12 Tf 72 700 Td (Fine) Tj ET"),
+         Stream("0 0 rg 72 700 100 20 re f"),
+         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"});
+    rasters = RenderDocument(stub.get(), broken_first, 36.0,
+                             pdfv1::PIXEL_FORMAT_RGBA8, std::nullopt, &status);
+    Check(status.error_code() == grpc::INTERNAL && rasters.empty() &&
+              status.error_message().find("page 0") != std::string::npos,
+          "Render stops at the first page it cannot decode");
+
+    // Over ParseStream the same failure ends the RenderPages request
+    // ENGINE_ERROR with the page in its detail; the stream and the open's
+    // parse are not failed by it.
+    pdfv1::ParseStreamOpen open;
+    open.add_families(pdfv1::PDF_FAMILY_TEXT_CELLS);
+    pdfv1::ParseStreamRequest render = parse_stream_checks::RenderMessage(5, 36.0);
+    render.mutable_render()->mutable_pages()->set_begin(1);
+    render.mutable_render()->mutable_pages()->set_end(2);
+    const parse_stream_checks::StreamRun run = parse_stream_checks::Run(
+        stub.get(),
+        parse_stream_checks::Upload(open, broken, broken.size(), {{99, render}}));
+    Check(run.status.ok(),
+          "ParseStream with a failed render still finishes OK");
+    Check(run.DoneOf(0) != nullptr &&
+              run.DoneOf(0)->outcome() == pdfv1::REQUEST_OUTCOME_OK,
+          "ParseStream: the open's parse ends OK beside a failed render");
+    const pdfv1::RequestDone* render_done = run.DoneOf(5);
+    Check(render_done != nullptr &&
+              render_done->outcome() == pdfv1::REQUEST_OUTCOME_ENGINE_ERROR,
+          "ParseStream: a render of an undecodable page ends ENGINE_ERROR");
+    Check(render_done != nullptr &&
+              render_done->detail().find("page 1") != std::string::npos,
+          "ParseStream: the failed render's detail names the page");
+    Check(run.RenderOf(5).empty(),
+          "ParseStream: the failed render carries no raster");
   }
 
   // A cancelled call stops decoding: Parse sends its header before any page
