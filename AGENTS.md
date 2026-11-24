@@ -54,6 +54,18 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   jpeglib's, and LZW through the replacement filter in
   `src/lzw_filter.{h,cpp}` (qpdf's has no limit). `test/fixtures/bomb.pdf`
   and `lzw.pdf` pin these.
+- Nothing damaged or left out goes out as a whole document. The call's
+  qpdf handle (`DocumentPages`) is where the service learns of it, since
+  the engine only logs: qpdf's warnings are read after the open and after
+  each page's decode and ride in the `Parse` trailer (`AddQpdfWarnings`);
+  the page tree's `/Count` is checked against the pages found;
+  `UndecodableContent` asks qpdf to decode a page's content streams before
+  the engine does (Parse warns on the page, Render fails it); an image
+  over the pixel budget is swapped for a one-pixel stand-in so it is never
+  decoded, and a page that draws it fails `RESOURCE_EXHAUSTED`
+  (`OversizedImages`, `DrawnOversizedImage`). Do not go back to removing
+  the image and rendering the page without it. `DocMeta` is filled from
+  the same handle (`FillDocMeta`).
 - `ParseStream` (bidi) lives in `src/parse_stream_session.*`: the session
   assembles the chunked upload once and serves the open, `ParsePages` and
   `RenderPages` through the same `ParseTo`/`RenderTo` bodies as `Parse` and

@@ -14,7 +14,8 @@ raw chars into model-ready cells with direction, space width and rendering
 mode), vector shapes, embedded font programs, plus the tier 0 floor: typed
 load status, page inventory, and blend2d page rasters (RGBA8, BGRA8, RGB8,
 BGR8 or GRAY8, as requested). Placed images, hyperlinks, form-field
-widgets, the outline, and the XMP packet ride along. Families the engine's
+widgets, the outline, and document metadata (the info dictionary, the
+PDF version and the XMP packet) ride along. Families the engine's
 public surface does not expose (annotations as typed data, encryption
 details, attachments, signatures, JavaScript, the structure tree,
 thumbnails, and its internal resource dictionaries) are reported
@@ -190,8 +191,11 @@ the environment:
 Image samples are bounded before they are decoded. An image XObject a
 page reaches (through its forms, patterns and Type3 fonts too) that
 declares more pixels than the budget, or whose `/SMask` or `/Mask` does,
-is left out of the page before the engine decodes it, and the service
-logs which one at ERROR; the page renders without it. `/Width` and
+is never decoded, and a page that draws it is not rendered without it:
+the call ends `RESOURCE_EXHAUSTED` at that page, naming the page and the
+image (`Render failed on page 1: it draws image /Im0, ...`), after the
+pages before it. A page that only shares a resource dictionary with such
+an image and does not draw it renders as usual. `/Width` and
 `/Height` count whether they are integers or reals, as the engine reads
 both. A stream that inflates past the decoded stream limit, whatever size
 it declares, is cut off there and treated as undecodable. qpdf's own
@@ -199,3 +203,41 @@ it declares, is cut off there and treated as undecodable. qpdf's own
 that has; qpdf's other decoders (ASCIIHex, ASCII85, Crypt) never give more
 than four bytes per input byte. `Parse` never decodes image
 samples, so it still reports every image's placement and size.
+
+## Damaged documents
+
+qpdf repairs what it can and carries on, and the engine draws what is
+left. Neither is passed off as a whole document:
+
+- What qpdf says while it opens the document (a cross-reference table it
+  had to rebuild, an object it could not read) rides in the `Parse`
+  trailer as document-level `ParseWarning`s, each message starting
+  `qpdf: `. What it says while a page is decoded rides there with that
+  page's index. A page or a load lists at most 16 different warnings and
+  counts the rest in one more.
+- qpdf drops a page-tree kid it cannot read without a warning, so the
+  service compares the page tree's `/Count` with the pages found: a
+  difference is a `PDF_FAMILY_PAGE_INVENTORY` warning, and a document
+  that declares pages, or needed a repair, and has no page left is
+  `LOAD_STATUS_CORRUPT`, from `Probe`, `Parse` and `Render` alike.
+- A page whose content stream does not decode (a damaged or mislabelled
+  filter, or a stream over `GRPC_QPARSE_MAX_DECODED_STREAM_BYTES`) would
+  come out of the engine as a blank page. `Parse` still sends the page's
+  chunk, with what the page has besides its content, and warns on that
+  page (`content stream does not decode, ...`); `Render` ends `INTERNAL`
+  at it. The service asks qpdf to decode the page's content streams
+  before the engine does, which costs one more decode of them per page.
+
+Not yet said: an image whose samples do not decode is still left out of a
+`Render` raster without a word, because `PageRaster` has no field to say
+it in.
+
+## Document metadata
+
+`DocMeta` comes from the trailer's info dictionary (the standard text
+keys as UTF-8 whatever their encoding in the file, both dates and
+`/Trapped` as stored, every other key as a `CustomInfoEntry`), the PDF
+version from the header or a later catalog `/Version`, `linearized`,
+`tagged` from the catalog's `/MarkInfo /Marked`, and the XMP packet. An
+info value that is not text, a name, a number or a boolean is not carried
+and gets a `PDF_FAMILY_DOC_METADATA` warning naming its key.

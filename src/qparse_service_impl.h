@@ -39,7 +39,8 @@ inline constexpr uint64_t kMaxRenderPixels = uint64_t{1} << 27;
 // max_pixels, or 65535 pixels on a side (the rasterizer's own limit),
 // fails the call with RESOURCE_EXHAUSTED before any page is rendered. An
 // image XObject with more than max_pixels pixels, or whose soft mask has,
-// is left out of the page before its samples are decoded.
+// is never decoded, and the page that draws it fails with
+// RESOURCE_EXHAUSTED.
 struct RenderLimits {
   // GRPC_QPARSE_RENDER_MAX_PIXELS, at most kMaxRenderPixels.
   uint64_t max_pixels = kMaxRenderPixels;

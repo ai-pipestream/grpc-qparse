@@ -64,7 +64,8 @@ bool BoxNear(const pdfv1::BoundingBox& box, const std::array<double, 4>& want,
 }
 
 // Writes numbered objects into a PDF with a classic cross-reference table.
-std::string AssemblePdf(const std::vector<std::string>& objects) {
+std::string AssemblePdf(const std::vector<std::string>& objects,
+                        const std::string& trailer_entries = "") {
   std::string out = "%PDF-1.7\n";
   std::vector<size_t> offsets;
   for (size_t i = 0; i < objects.size(); ++i) {
@@ -80,7 +81,8 @@ std::string AssemblePdf(const std::vector<std::string>& objects) {
     out += line;
   }
   out += "trailer\n<< /Size " + std::to_string(objects.size() + 1) +
-         " /Root 1 0 R >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
+         " /Root 1 0 R" + trailer_entries + " >>\nstartxref\n" +
+         std::to_string(xref) + "\n%%EOF\n";
   return out;
 }
 
@@ -134,7 +136,39 @@ struct ParseResult {
   std::map<uint32_t, pdfv1::PageChunk> pages;
   std::map<uint32_t, pdfv1::FontRef> fonts;
   std::vector<pdfv1::EmbeddedFont> embedded;
+  std::vector<pdfv1::DocMeta> doc_meta;
   std::optional<pdfv1::ParseTrailer> trailer;
+
+  // The trailer's warnings about one page.
+  std::vector<pdfv1::ParseWarning> PageWarnings(uint32_t page) const {
+    std::vector<pdfv1::ParseWarning> out;
+    if (!trailer.has_value()) return out;
+    for (const auto& warning : trailer->warnings()) {
+      if (warning.has_page_index() && warning.page_index() == page) {
+        out.push_back(warning);
+      }
+    }
+    return out;
+  }
+
+  // The trailer's warnings about the document as a whole.
+  std::vector<pdfv1::ParseWarning> DocumentWarnings() const {
+    std::vector<pdfv1::ParseWarning> out;
+    if (!trailer.has_value()) return out;
+    for (const auto& warning : trailer->warnings()) {
+      if (!warning.has_page_index()) out.push_back(warning);
+    }
+    return out;
+  }
+
+  // The count the trailer gives for a family; zero when it has none.
+  uint64_t Count(pdfv1::PdfFamily family) const {
+    if (!trailer.has_value()) return 0;
+    for (const auto& entry : trailer->counts()) {
+      if (entry.family() == family) return entry.count();
+    }
+    return 0;
+  }
 };
 
 ParseResult ParseDocument(pdfv1::PdfBackendService::Stub* stub,
@@ -163,6 +197,8 @@ ParseResult ParseDocument(pdfv1::PdfBackendService::Stub* stub,
       }
     } else if (msg.has_embedded_font()) {
       result.embedded.push_back(msg.embedded_font());
+    } else if (msg.has_doc_meta()) {
+      result.doc_meta.push_back(msg.doc_meta());
     } else if (msg.has_trailer()) {
       result.trailer = msg.trailer();
     }
@@ -948,12 +984,12 @@ int main(int argc, char** argv) {
     Check(status.ok() && rasters.size() == 1,
           "the page within the budget renders on its own");
 
-    // An image with more pixels than the budget is left out of the page
-    // before its samples are decoded, whatever the page's own size: page 0
-    // draws a 400 x 400 black image (160000 pixels, over the budget) and
-    // page 1 a 200 x 200 one (within it), each over its whole 100 pt page.
-    // Page 2's image declares its 400 x 400 as reals, which the engine
-    // takes as well, so it counts the same.
+    // An image with more pixels than the budget is never decoded, and a
+    // page that draws one fails with RESOURCE_EXHAUSTED naming it, whatever
+    // the page's own size: page 0 draws a 400 x 400 black image (160000
+    // pixels, over the budget) and page 1 a 200 x 200 one (within it), each
+    // over its whole 100 pt page. Page 2's image declares its 400 x 400 as
+    // reals, which the engine takes as well, so it counts the same.
     auto image_page = [](int side, const std::string& suffix = "") {
       const std::string size = std::to_string(side) + suffix;
       return "<< /Type /XObject /Subtype /Image /Width " + size +
@@ -976,57 +1012,293 @@ int main(int argc, char** argv) {
          "<< /Type /Page /Parent 2 0 R /Contents 5 0 R "
          "/Resources << /XObject << /Im0 9 0 R >> >> >>",
          image_page(400, ".0")});
+    auto over_budget = [](const grpc::Status& failed, const char* page) {
+      return failed.error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED &&
+             failed.error_message().find(page) != std::string::npos &&
+             failed.error_message().find("/Im0") != std::string::npos;
+    };
     rasters = RenderDocument(small_stub.get(), images, 36.0,
                              pdfv1::PIXEL_FORMAT_GRAY8, std::nullopt, &status);
-    Check(status.ok() && rasters.size() == 3,
-          "a page with an image over the budget still renders");
-    if (rasters.size() == 3) {
-      auto center = [](const pdfv1::PageRaster& raster) {
-        return static_cast<unsigned char>(
-            raster.pixels()[(raster.height_px() / 2) * raster.stride_bytes() +
-                            raster.width_px() / 2]);
-      };
-      Check(center(rasters[0]) > 200,
-            "the image over the budget is left out, the page stays white");
-      Check(center(rasters[1]) < 50, "the image within the budget is drawn");
-      Check(center(rasters[2]) > 200,
-            "an image over the budget in real numbers is left out too");
+    Check(rasters.empty() && over_budget(status, "page 0"),
+          "a page that draws an image over the budget fails, naming it");
+    rasters = RenderDocument(small_stub.get(), images, 36.0,
+                             pdfv1::PIXEL_FORMAT_GRAY8, std::make_pair(1u, 2u),
+                             &status);
+    Check(status.ok() && rasters.size() == 1,
+          "the page with an image within the budget renders");
+    if (rasters.size() == 1) {
+      const pdfv1::PageRaster& raster = rasters[0];
+      Check(static_cast<unsigned char>(
+                raster.pixels()[(raster.height_px() / 2) * raster.stride_bytes() +
+                                raster.width_px() / 2]) < 50,
+            "the image within the budget is drawn");
     }
+    rasters = RenderDocument(small_stub.get(), images, 36.0,
+                             pdfv1::PIXEL_FORMAT_GRAY8, std::make_pair(2u, 3u),
+                             &status);
+    Check(rasters.empty() && over_budget(status, "page 2"),
+          "an image over the budget in real numbers fails its page too");
     small_server->Shutdown();
     Check(grpc_qparse::RenderLimits{}.max_pixels ==
               grpc_qparse::kMaxRenderPixels,
           "the default budget is the most one message carries");
   }
 
+  // Document metadata comes from the info dictionary, the header and the
+  // catalog as well as the XMP packet. rich.pdf has an info dictionary and
+  // declares itself tagged; hello.pdf has neither, and still says which
+  // PDF version it is.
+  {
+    ParseResult parsed = ParseDocument(
+        stub.get(), rich, {pdfv1::PDF_FAMILY_DOC_METADATA}, std::nullopt);
+    Check(parsed.status.ok() && parsed.doc_meta.size() == 1,
+          "rich.pdf streams one DocMeta");
+    if (parsed.doc_meta.size() == 1) {
+      const pdfv1::DocMeta& meta = parsed.doc_meta[0];
+      Check(meta.title() == "Rich Fixture" && meta.author() == "Fixture Author" &&
+                meta.subject() == "tier 1-2" &&
+                meta.keywords() == "rich fixture families" &&
+                meta.creator() == "make_rich_pdf.py" &&
+                meta.producer() == "by hand",
+            "the info dictionary's text keys are read");
+      Check(meta.created_raw() == "D:20260904090000Z" &&
+                meta.modified_raw() == "D:20260904100000Z",
+            "both dates are carried as stored");
+      Check(meta.pdf_version() == "1.7", "the header's PDF version is read");
+      Check(meta.tagged(), "/MarkInfo /Marked true reads as tagged");
+      Check(meta.has_linearized() && !meta.linearized(),
+            "a document that is not linearized says so");
+    }
+    Check(parsed.Count(pdfv1::PDF_FAMILY_DOC_METADATA) == 1,
+          "the trailer counts the DocMeta");
+
+    ParseResult plain = ParseDocument(
+        stub.get(), hello, {pdfv1::PDF_FAMILY_DOC_METADATA}, std::nullopt);
+    Check(plain.status.ok() && plain.doc_meta.size() == 1 &&
+              plain.doc_meta[0].pdf_version() == "1.4" &&
+              !plain.doc_meta[0].has_title() && !plain.doc_meta[0].tagged(),
+          "hello.pdf's DocMeta carries its version and no title");
+
+    // A title in UTF-16, /Trapped as a name, and a key outside the
+    // standard set.
+    const std::string custom = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+         "<< /Title <FEFF00C9007400E9> /Trapped /True "
+         "/Department (Records) /Revision 7 >>"},
+        " /Info 4 0 R");
+    ParseResult with_custom = ParseDocument(
+        stub.get(), custom, {pdfv1::PDF_FAMILY_DOC_METADATA}, std::nullopt);
+    Check(with_custom.status.ok() && with_custom.doc_meta.size() == 1,
+          "the custom info document streams one DocMeta");
+    if (with_custom.doc_meta.size() == 1) {
+      const pdfv1::DocMeta& meta = with_custom.doc_meta[0];
+      Check(meta.title() == "\xc3\x89t\xc3\xa9", "a UTF-16 title arrives as UTF-8");
+      Check(meta.trapped() == "True", "/Trapped is carried as stored");
+      std::map<std::string, std::string> entries;
+      for (const auto& entry : meta.custom()) entries[entry.key()] = entry.value();
+      Check(entries.size() == 2 && entries["Department"] == "Records" &&
+                entries["Revision"] == "7",
+            "info keys outside the standard set are carried");
+    }
+  }
+
+  // What qpdf repaired while opening a document is said in the trailer. A
+  // document whose startxref points nowhere loads from a cross-reference
+  // table qpdf rebuilds by scanning the file; a clean document carries no
+  // warning. A document that only opens through such a repair and then
+  // has no page at all is corrupt, not an empty success.
+  {
+    std::string lost_xref = hello;
+    const size_t at = lost_xref.rfind("startxref\n");
+    Check(at != std::string::npos, "hello.pdf has a startxref to damage");
+    if (at != std::string::npos) {
+      lost_xref.replace(at, std::string::npos, "startxref\n7\n%%EOF\n");
+    }
+    ParseResult repaired = ParseDocument(stub.get(), lost_xref, {}, std::nullopt);
+    Check(repaired.status.ok() && repaired.pages.size() == 1 &&
+              FindCell(repaired.pages[0], "Hello PDF") != nullptr,
+          "a document with a lost xref table still parses");
+    const std::vector<pdfv1::ParseWarning> said = repaired.DocumentWarnings();
+    Check(!said.empty(), "the trailer says qpdf repaired the document");
+    bool all_qpdf = !said.empty();
+    for (const auto& warning : said) {
+      if (warning.message().rfind("qpdf: ", 0) != 0) all_qpdf = false;
+    }
+    Check(all_qpdf, "load warnings are marked as qpdf's");
+
+    ParseResult clean = ParseDocument(stub.get(), hello, {}, std::nullopt);
+    Check(clean.status.ok() && clean.trailer.has_value() &&
+              clean.trailer->warnings_size() == 0,
+          "a clean document parses without warnings");
+
+    // The page tree's only kid is an object the file does not hold. qpdf
+    // drops such a kid without a word, so the count the page tree declares
+    // is what tells: a document that declares a page and has none is
+    // corrupt, for Probe as for Parse.
+    const std::string no_pages = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [9 0 R] /Count 1 >>"});
+    ParseResult lost = ParseDocument(stub.get(), no_pages, {}, std::nullopt);
+    Check(lost.status.ok() &&
+              lost.header.capabilities().load_status() ==
+                  pdfv1::LOAD_STATUS_CORRUPT &&
+              !lost.header.capabilities().load_detail().empty() &&
+              !lost.trailer.has_value(),
+          "a document that declares a page and has none is corrupt");
+    {
+      grpc::ClientContext ctx;
+      pdfv1::ProbeRequest request;
+      request.mutable_document()->set_data(no_pages);
+      pdfv1::ProbeResponse response;
+      const grpc::Status probed = stub->Probe(&ctx, request, &response);
+      Check(probed.ok() && response.capabilities().load_status() ==
+                               pdfv1::LOAD_STATUS_CORRUPT,
+            "Probe gives the same verdict");
+    }
+
+    // One of two declared pages is such a lost object: the document parses
+    // with the page it has, and the trailer says one is missing.
+    const std::string one_lost = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R 9 0 R] /Count 2 >>",
+         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"});
+    ParseResult partial = ParseDocument(stub.get(), one_lost, {}, std::nullopt);
+    bool count_said = false;
+    for (const auto& warning : partial.DocumentWarnings()) {
+      if (warning.family() == pdfv1::PDF_FAMILY_PAGE_INVENTORY &&
+          warning.message().find("declares 2 page(s)") != std::string::npos) {
+        count_said = true;
+      }
+    }
+    Check(partial.status.ok() && partial.header.pages_size() == 1 && count_said,
+          "a page the page tree declares and qpdf cannot find is said");
+  }
+
+  // A page whose content stream does not decode is not an empty page. An
+  // inline document's page 1 claims Flate content that is not; lzw.pdf's
+  // page 0 is the LZW bomb the decoded stream limit stops. Parse still
+  // returns every page and warns on the damaged one; Render fails at it,
+  // after the pages before it.
+  {
+    const std::string not_flate = "this is not flate data, whatever it says";
+    const std::string damaged = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] "
+         "/Resources << /Font << /F1 5 0 R >> >> >>",
+         "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>",
+         "<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>",
+         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+         Stream("BT /F1 24 Tf 100 700 Td (Whole page) Tj ET"),
+         "<< /Filter /FlateDecode /Length " + std::to_string(not_flate.size()) +
+             " >>\nstream\n" + not_flate + "\nendstream"});
+    ParseResult parsed = ParseDocument(
+        stub.get(), damaged, {pdfv1::PDF_FAMILY_TEXT_CELLS}, std::nullopt);
+    Check(parsed.status.ok() && parsed.pages.size() == 2 &&
+              FindCell(parsed.pages[0], "Whole page") != nullptr,
+          "the damaged-content document parses, with its whole page");
+    Check(parsed.PageWarnings(0).empty(), "the whole page carries no warning");
+    const std::vector<pdfv1::ParseWarning> on_damaged = parsed.PageWarnings(1);
+    bool content_named = false;
+    for (const auto& warning : on_damaged) {
+      if (warning.message().find("content stream") != std::string::npos) {
+        content_named = true;
+      }
+    }
+    Check(content_named,
+          "the page whose content does not decode is warned about");
+
+    grpc::Status status;
+    std::vector<pdfv1::PageRaster> rasters = RenderDocument(
+        stub.get(), damaged, 36.0, pdfv1::PIXEL_FORMAT_GRAY8, std::nullopt,
+        &status);
+    Check(rasters.size() == 1 && rasters[0].page_index() == 0,
+          "the whole page renders before the failure");
+    Check(status.error_code() == grpc::StatusCode::INTERNAL &&
+              status.error_message().find("page 1") != std::string::npos &&
+              status.error_message().find("content stream") != std::string::npos,
+          "Render fails at the page whose content does not decode");
+
+    const std::string lzw = ReadFile(fixture_dir + "/lzw.pdf");
+    ParseResult bombed = ParseDocument(
+        stub.get(), lzw, {pdfv1::PDF_FAMILY_TEXT_CELLS}, std::nullopt);
+    Check(bombed.status.ok() && !bombed.PageWarnings(0).empty() &&
+              bombed.PageWarnings(2).empty() && bombed.PageWarnings(3).empty(),
+          "lzw.pdf's bombed content stream is warned about, its honest pages "
+          "are not");
+    rasters = RenderDocument(stub.get(), lzw, 36.0, pdfv1::PIXEL_FORMAT_GRAY8,
+                             std::make_pair(0u, 1u), &status);
+    Check(rasters.empty() &&
+              status.error_code() == grpc::StatusCode::INTERNAL &&
+              status.error_message().find("page 0") != std::string::npos,
+          "Render fails on lzw.pdf's bombed content stream");
+  }
+
+  // An image over the pixel budget is never decoded, and a page that draws
+  // one is not rendered without it: Render fails there with
+  // RESOURCE_EXHAUSTED naming the page and the image. A page that only
+  // shares a resource dictionary with such an image, and does not draw it,
+  // renders as usual.
+  {
+    const std::string shared = AssemblePdf(
+        {"<< /Type /Catalog /Pages 2 0 R >>",
+         "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] "
+         "/Resources << /Font << /F1 5 0 R >> /XObject << /Huge 8 0 R >> >> >>",
+         "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>",
+         "<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>",
+         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+         Stream("BT /F1 24 Tf 100 700 Td (No image here) Tj ET"),
+         Stream("q 200 0 0 200 100 400 cm /Huge Do Q"),
+         "<< /Type /XObject /Subtype /Image /Width 12000 /Height 12000 "
+         "/ColorSpace /DeviceGray /BitsPerComponent 8 /Length 4 >>\n"
+         "stream\n\x01\x02\x03\x04\nendstream"});
+    grpc::Status status;
+    std::vector<pdfv1::PageRaster> rasters = RenderDocument(
+        stub.get(), shared, 36.0, pdfv1::PIXEL_FORMAT_GRAY8,
+        std::make_pair(0u, 1u), &status);
+    Check(status.ok() && rasters.size() == 1,
+          "a page that does not draw the oversized image renders");
+    rasters = RenderDocument(stub.get(), shared, 36.0,
+                             pdfv1::PIXEL_FORMAT_GRAY8, std::nullopt, &status);
+    Check(rasters.size() == 1 && rasters[0].page_index() == 0,
+          "the page before the oversized image is delivered");
+    Check(status.error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED &&
+              status.error_message().find("page 1") != std::string::npos &&
+              status.error_message().find("/Huge") != std::string::npos,
+          "Render fails at the page that draws the oversized image, naming it");
+  }
+
   // bomb.pdf: two images deflated twice, a few kilobytes that inflate to
   // hundreds of megabytes of black. Page 0's honestly declares 12000 x
-  // 12000, over the default pixel budget, and is left out before a sample
-  // is decoded; page 1's declares 64 x 64 but inflates to 256 MiB, and the
-  // decoded stream limit stops it. Both pages render, white where the
-  // images would be, and Parse, which never decodes samples, still lists
-  // both.
+  // 12000, over the default pixel budget: it is never decoded, and the
+  // page that draws it fails with RESOURCE_EXHAUSTED. Page 1's declares
+  // 64 x 64 but inflates to 256 MiB, and the decoded stream limit stops
+  // it; the call returns, with the square white where the image would be.
+  // Parse, which never decodes samples, still lists both.
   {
     const std::string bomb = ReadFile(fixture_dir + "/bomb.pdf");
     Check(!bomb.empty() && bomb.size() < 8192, "bomb.pdf read, and tiny");
-    ErrorLog errors;
-    loguru::add_callback("bomb", &ErrorLog::Collect, &errors,
-                         loguru::Verbosity_ERROR);
     grpc::Status status;
     std::vector<pdfv1::PageRaster> rasters = RenderDocument(
         stub.get(), bomb, 36.0, pdfv1::PIXEL_FORMAT_GRAY8, std::nullopt,
         &status);
-    loguru::remove_callback("bomb");
-    Check(status.ok() && rasters.size() == 2, "bomb.pdf renders both pages");
-    for (const auto& raster : rasters) {
+    Check(rasters.empty() &&
+              status.error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED &&
+              status.error_message().find("page 0") != std::string::npos &&
+              status.error_message().find("/Im0") != std::string::npos,
+          "bomb.pdf page 0 fails on its oversized image, undecoded");
+    rasters = RenderDocument(stub.get(), bomb, 36.0, pdfv1::PIXEL_FORMAT_GRAY8,
+                             std::make_pair(1u, 2u), &status);
+    Check(status.ok() && rasters.size() == 1,
+          "bomb.pdf page 1 returns under the decoded stream limit");
+    if (rasters.size() == 1) {
       // The square is 100..300 by 400..600 pt, (100, 146) px at 36 dpi.
-      const size_t center = 146 * size_t{raster.stride_bytes()} + 100;
-      Check(raster.pixels().size() > center &&
-                static_cast<unsigned char>(raster.pixels()[center]) > 200,
-            "bomb.pdf page " + std::to_string(raster.page_index()) +
-                ": the image is not drawn");
+      const size_t center = 146 * size_t{rasters[0].stride_bytes()} + 100;
+      Check(rasters[0].pixels().size() > center &&
+                static_cast<unsigned char>(rasters[0].pixels()[center]) > 200,
+            "bomb.pdf page 1: the image is not drawn");
     }
-    Check(errors.Contains("page 0: image /Im0 is left out"),
-          "the log names the image left out of page 0");
     ParseResult parsed = ParseDocument(
         stub.get(), bomb, {pdfv1::PDF_FAMILY_PLACED_IMAGES}, std::nullopt);
     Check(parsed.status.ok() && parsed.pages.size() == 2 &&
@@ -1040,10 +1312,10 @@ int main(int argc, char** argv) {
   // lzw.pdf: page 0's content stream and page 1's image samples are LZW
   // bombs, a few kilobytes of codes that decode to 260 MiB of zeros under
   // a Flate layer that inflates to far less than the limit. The decoded
-  // stream limit stops the LZW stage: Parse returns, and Render leaves the
-  // image out, so page 1's square stays white. Pages 2 and 3 are honest
-  // LZW text, the second with /EarlyChange 0 and a PNG predictor, and
-  // still decode.
+  // stream limit stops the LZW stage: Parse returns, with the warning on
+  // page 0 checked above, and Render leaves the image out, so page 1's
+  // square stays white. Pages 2 and 3 are honest LZW text, the second with
+  // /EarlyChange 0 and a PNG predictor, and still decode.
   {
     const std::string lzw = ReadFile(fixture_dir + "/lzw.pdf");
     Check(!lzw.empty() && lzw.size() < 65536, "lzw.pdf read, and small");
