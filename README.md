@@ -13,9 +13,10 @@ What this backend is for: reading-order text cells (its sanitizers merge
 raw chars into model-ready cells with direction, space width and rendering
 mode), vector shapes, embedded font programs, plus the tier 0 floor: typed
 load status, page inventory, and blend2d page rasters (RGBA8, BGRA8, RGB8,
-BGR8 or GRAY8, as requested). Placed images, hyperlinks, form-field
-widgets, the outline, and document metadata (the info dictionary, the
-PDF version and the XMP packet) ride along. Families the engine's
+BGR8 or GRAY8, as requested). Placed images (geometry and declared size,
+no samples), hyperlinks, form-field widgets, the outline, and document
+metadata (the info dictionary, the PDF version and the XMP packet) ride
+along. Families the engine's
 public surface does not expose (annotations as typed data, encryption
 details, attachments, signatures, JavaScript, the structure tree,
 thumbnails, and its internal resource dictionaries) are reported
@@ -36,8 +37,10 @@ font table; programs are decoded and sent, once each, only when
 A document that does not open gets the typed verdict qpdf's error code
 gives: `LOAD_STATUS_PASSWORD_REQUIRED` for an encrypted file opened
 without a password, `LOAD_STATUS_PASSWORD_INCORRECT` when the password
-given does not open it, `LOAD_STATUS_CORRUPT` for damage qpdf cannot
-recover from, and `LOAD_STATUS_ENGINE_ERROR` for anything else.
+given does not open it, `LOAD_STATUS_UNSUPPORTED_ENCRYPTION` for a
+security handler, `/V` or `/R` qpdf does not implement,
+`LOAD_STATUS_CORRUPT` for damage qpdf cannot recover from, and
+`LOAD_STATUS_ENGINE_ERROR` for anything else.
 
 The engine is safe to use concurrently through independent per-request
 decoder instances, so the service is plain thread-per-request; there is no
@@ -228,9 +231,78 @@ left. Neither is passed off as a whole document:
   at it. The service asks qpdf to decode the page's content streams
   before the engine does, which costs one more decode of them per page.
 
-Not yet said: an image whose samples do not decode is still left out of a
-`Render` raster without a word, because `PageRaster` has no field to say
-it in.
+- An image whose samples do not decode is left out of a `Render` raster,
+  and the `RenderResponse` that carries the raster says so in its
+  `warnings`, naming the image. What qpdf said while the page was decoded
+  rides there too.
+- A page with no usable `/MediaBox`, its own or inherited, is sized as US
+  Letter. That is a guess, and a `PDF_FAMILY_PAGE_INVENTORY` warning on
+  the page says so, in the `Parse` trailer and beside the page's raster.
+  The first 16 such pages are listed and the rest counted.
+
+One thing qpdf says is not passed on. The engine asks each embedded font
+program's stream for its `/Length1` to `/Length3` as if the stream were a
+dictionary, on every document with an embedded font, and qpdf answers
+with a type warning each time. That is about the engine's question, not
+the document, so a warning of that kind which names a font program
+stream is dropped. The same warning about any other stream stays.
+
+## Links, form fields and the outline
+
+These three are read from the call's qpdf handle straight into the
+contract's messages (`src/qpdf_readers.cpp`). The engine offers them only
+as untyped JSON, and thinner than the document: titles with no targets,
+links with a URI action only, a missing `/Rect` number read as 0.
+
+- A link with a `/URI` action is a `uri`. A link with a `/GoTo` action or
+  a `/Dest` is a `destination` in the target page's frame, named
+  destinations resolved through `/Dests` and the `/Names` tree. A link
+  whose destination names no page of the document, or whose action is of
+  another type (`/GoToR`, `/Launch`, `/Named`), cannot be carried and is
+  counted in a `PDF_FAMILY_HYPERLINKS` warning on its page, by action
+  type. A link with no usable `/Rect` is listed with no `bbox`, and
+  counted.
+- Every widget annotation is one `FormField`, with its type, flags, name,
+  value and `/TU` resolved through the `/Parent` chain. A widget with no
+  usable `/Rect` is listed with no `rect` and counted; one with no field
+  type, or an unknown one, is listed with no `kind`.
+- The outline is walked by hand, because qpdf's outline helper stops at
+  level 50 without a word. Each item carries where it leads. An item
+  whose destination names no page keeps its title and is counted; items
+  below level 65 are left out and counted; an item reached twice (a
+  `/First` or `/Next` loop) is listed once.
+
+## The engine's page tables
+
+Text cells, shapes and images are the one place the engine's JSON is
+still read, since the engine has no typed surface for them
+(`src/engine_tables.cpp`). The engine is pinned to a commit, so the shape
+read is the shape that commit writes, and anything else is never taken
+for an empty page: a table that is missing, or lacks a column a reader
+needs, fails the page with a warning that names it, and a row that does
+not fit is left out and counted in a warning on the page.
+`qparse_engine_tables_test` feeds both kinds in by hand.
+
+`include_image_data` is not served: the engine's public surface gives an
+image's placement and declared size and no samples. `Probe` says so in
+the `PDF_FAMILY_PLACED_IMAGES` capability detail, and a `Parse` that asks
+for image data is told in a trailer warning.
+
+## Names
+
+A PDF name is bytes in any encoding (a `/BaseFont` in GBK, a choice
+value, an appearance state, an info key), and the contract's strings are
+UTF-8; protobuf refuses a message with one that is not, which would cost
+the client the rest of the stream. Every message is made valid on its
+way out (`src/valid_utf8.cpp`): well-formed UTF-8 passes unchanged, and
+any other byte is read as Latin-1, the rule grpc-pdfium and grpc-poppler
+follow, so the three backends report the same name for the same bytes.
+
+The engine puts U+FFFD for each such byte, which makes two fonts named
+in a legacy encoding one font to it. A `FontRef` therefore carries the
+name as the document writes it, read from the font dictionary, and the
+engine's form is only the key a cell's font is found by. A font that
+only an annotation's appearance brings keeps the engine's form.
 
 ## Document metadata
 
